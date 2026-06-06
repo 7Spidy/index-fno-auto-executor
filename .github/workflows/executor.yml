@@ -1,0 +1,47 @@
+# executor.yml — F&O Auto-Executor
+#
+# Triggered every 1 minute by cron-job.org (spec §0, §19):
+#   POST https://api.github.com/repos/7Spidy/index-fno-auto-executor/actions/workflows/executor.yml/dispatches
+#   Header: Authorization: Bearer {GITHUB_PAT}
+#   Header: Accept: application/vnd.github+json
+#   Body:   {"ref": "main"}
+#
+# cron-job.org schedule: every 1 min, Mon–Fri, 04:10–09:40 UTC (= 09:40–15:10 IST)
+#
+# Prerequisite: morning-login.yml must have run earlier today (writes kite:access_token
+# and instrument caches to Redis).
+
+name: executor
+
+on:
+  workflow_dispatch:        # triggered by cron-job.org every 1 min
+
+permissions:
+  contents: read
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2      # each run must complete well within the 1-min cadence
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"            # pip cache — keeps cold start to ~15-20s (spec §0)
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run executor tick
+        env:
+          REDIS_URL:            ${{ secrets.REDIS_URL }}
+          KITE_API_KEY:         ${{ secrets.KITE_API_KEY }}
+          DISCORD_WEBHOOK_URL:  ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NOTION_TOKEN:         ${{ secrets.NOTION_TOKEN }}
+          NOTION_TRADE_DB_ID:   ${{ secrets.NOTION_TRADE_DB_ID }}
+          # PAPER_MODE defaults to "True" in config.py; override to "False" for live
+          PAPER_MODE:           ${{ vars.PAPER_MODE || 'True' }}
+        run: python -m executor.run
