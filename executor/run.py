@@ -46,7 +46,18 @@ _PAPER_MODE = os.getenv("PAPER_MODE", str(config.PAPER_MODE)).lower() not in ("f
 
 
 def _connect_redis() -> redis_lib.Redis:
-    url = os.environ["REDIS_URL"]
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "REDIS_URL is empty or unset. Set the REDIS_URL repository secret "
+            "(GitHub → Settings → Secrets and variables → Actions) to your "
+            "Upstash connection string, e.g. rediss://default:<password>@<host>:<port>"
+        )
+    if not url.startswith(("redis://", "rediss://", "unix://")):
+        raise RuntimeError(
+            f"REDIS_URL has an invalid scheme: {url.split('://', 1)[0]!r}. "
+            "It must start with one of: redis://, rediss:// (Upstash uses rediss://), unix://"
+        )
     r = redis_lib.from_url(url, decode_responses=False)
     r.ping()
     return r
