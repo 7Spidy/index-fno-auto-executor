@@ -49,14 +49,20 @@ def _get_request_token(api_key: str, user_id: str, password: str, totp_secret: s
     }, allow_redirects=False)
     log.info("twofa ok (HTTP %d)", r2.status_code)
 
-    # Step 3: hit connect/login with the authenticated session → Kite redirects
-    # to the app's redirect_url with ?request_token=xxx
+    # Step 3: connect/login → redirects to /connect/finish?sess_id=...
     r3 = s.get(_CONNECT_URL.format(api_key=api_key), allow_redirects=False)
-    location = r3.headers.get("Location", "")
+    finish_url = r3.headers.get("Location", "")
+    if not finish_url:
+        raise RuntimeError(f"No redirect from connect/login (HTTP {r3.status_code})")
+    log.info("connect/login → %s", finish_url)
+
+    # Step 4: connect/finish → redirects to app redirect_url with ?request_token=xxx
+    r4 = s.get(finish_url, allow_redirects=False)
+    location = r4.headers.get("Location", "")
 
     if "request_token=" not in location:
         raise RuntimeError(
-            f"request_token not found in redirect (HTTP {r3.status_code}): {location!r}"
+            f"request_token not found in redirect (HTTP {r4.status_code}): {location!r}"
         )
 
     request_token = location.split("request_token=")[1].split("&")[0]
