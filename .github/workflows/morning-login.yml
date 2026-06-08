@@ -1,0 +1,48 @@
+# morning-login.yml — runs once per trading day at 09:00 IST (03:30 UTC)
+#
+# What it does:
+#   1. Headless Kite login (password + TOTP) → access_token
+#   2. Downloads NFO instruments dump → builds symbol caches
+#   3. Writes kite:access_token, kite:instruments, kite:option_tokens,
+#      kite:nifty_spot_token to Redis with 26-hour TTL
+#
+# Must complete before executor.yml starts ticking at 09:40 IST.
+#
+# Required secrets: REDIS_URL, KITE_API_KEY, KITE_API_SECRET,
+#                   KITE_USER_ID, KITE_PASSWORD, KITE_TOTP_SECRET
+
+name: morning-login
+
+on:
+  schedule:
+    - cron: "30 3 * * 1-5"   # 09:00 IST (UTC+5:30), Mon–Fri
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Morning Kite login
+        env:
+          REDIS_URL:        ${{ secrets.REDIS_URL }}
+          KITE_API_KEY:     ${{ secrets.KITE_API_KEY }}
+          KITE_API_SECRET:  ${{ secrets.KITE_API_SECRET }}
+          KITE_USER_ID:     ${{ secrets.KITE_USER_ID }}
+          KITE_PASSWORD:    ${{ secrets.KITE_PASSWORD }}
+          KITE_TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
+        run: python -m executor.morning_login
