@@ -22,8 +22,9 @@ log = logging.getLogger(__name__)
 
 TTL_SECONDS = 26 * 3600  # survives overnight; replaced next morning
 
-_LOGIN_URL = "https://kite.zerodha.com/api/login"
-_TWOFA_URL = "https://kite.zerodha.com/api/twofa"
+_LOGIN_URL   = "https://kite.zerodha.com/api/login"
+_TWOFA_URL   = "https://kite.zerodha.com/api/twofa"
+_CONNECT_URL = "https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
 
 
 def _get_request_token(api_key: str, user_id: str, password: str, totp_secret: str) -> str:
@@ -38,21 +39,24 @@ def _get_request_token(api_key: str, user_id: str, password: str, totp_secret: s
     request_id = body1["data"]["request_id"]
     log.info("password login ok, request_id=%s", request_id)
 
-    # Step 2: TOTP 2FA
+    # Step 2: TOTP 2FA — authenticates the session (may return 200 or 302)
     twofa_value = pyotp.TOTP(totp_secret).now()
     r2 = s.post(_TWOFA_URL, data={
-        "user_id":      user_id,
-        "request_id":   request_id,
-        "twofa_value":  twofa_value,
-        "twofa_type":   "totp",
-        "skip_session": "",
+        "user_id":     user_id,
+        "request_id":  request_id,
+        "twofa_value": twofa_value,
+        "twofa_type":  "totp",
     }, allow_redirects=False)
+    log.info("twofa ok (HTTP %d)", r2.status_code)
 
-    location = r2.headers.get("Location", "")
+    # Step 3: hit connect/login with the authenticated session → Kite redirects
+    # to the app's redirect_url with ?request_token=xxx
+    r3 = s.get(_CONNECT_URL.format(api_key=api_key), allow_redirects=False)
+    location = r3.headers.get("Location", "")
 
     if "request_token=" not in location:
         raise RuntimeError(
-            f"request_token not found in redirect (HTTP {r2.status_code}): {location!r}"
+            f"request_token not found in redirect (HTTP {r3.status_code}): {location!r}"
         )
 
     request_token = location.split("request_token=")[1].split("&")[0]
