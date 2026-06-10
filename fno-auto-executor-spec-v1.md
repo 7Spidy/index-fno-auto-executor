@@ -86,7 +86,7 @@ Signal bot writes on fire:
   "spot_close": 24512.4,
   "spot_sl": 24487.4,
   "spot_risk_pts": 25.0,
-  "target_rr": 3.0,
+  "target_rr": 1.5,
   "atm_delta": 0.50,
   "conviction": "label_only",
   "health_inputs": {
@@ -120,7 +120,7 @@ From the signal payload:
 premium_risk   = spot_risk_pts × ATM_DELTA         # e.g. 25 × 0.50 = ₹12.5
 entry_premium  = option LTP at fill (first executor run after intent)
 sl_premium     = entry_premium − premium_risk
-target_premium = entry_premium + (premium_risk × TARGET_RR)   # 3:1
+target_premium = entry_premium + (premium_risk × TARGET_RR)   # 1.5:1
 ```
 
 **Sizing:**
@@ -130,7 +130,7 @@ max_lots = floor(CAPITAL_RS × RISK_PCT / (premium_risk × lot_size))
 qty      = max_lots × lot_size   (minimum 1 lot; if even 1 lot exceeds, skip)
 ```
 
-> **Target note:** flat 3:1 R:R inherited from current code. Conviction is a display label only — does NOT scale target in v1. Conviction-scaled R:R is a documented v1.1 toggle, off by default.
+> **Target note:** flat 1.5:1 R:R (base target; changed 3.0 → 1.5 on 2026-06-10). Conviction is a display label only — does NOT scale target in v1. Conviction-scaled R:R is a documented v1.1 toggle, off by default.
 
 ---
 
@@ -165,7 +165,9 @@ qty      = max_lots × lot_size   (minimum 1 lot; if even 1 lot exceeds, skip)
 
 ## 8. Milestone ladder + runner mode (premium, every 1-min run)
 
-Let `T` = target premium − entry premium (= `premium_risk × 3`).
+Let `T` = target premium − entry premium (= `premium_risk × 1.5`).
+
+> Base target 1.5R as of 2026-06-10; runner mode still trails past T when health ≥ 75.
 Let `progress` = current LTP − entry premium (long) / entry premium − current LTP (short).
 
 | Milestone | Condition | Action |
@@ -334,7 +336,7 @@ RISK_PCT            = 0.02             # 2% per trade → ₹2,000 max risk
 
 # Signal inheritance
 ATM_DELTA           = 0.50
-TARGET_RR           = 3.0
+TARGET_RR           = 1.5
 MAX_RISK_POINTS     = 25
 
 # Entry gate

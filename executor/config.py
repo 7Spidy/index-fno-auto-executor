@@ -12,8 +12,8 @@ RISK_PCT             = 0.02          # 2% per trade → ₹2,000 max risk
 
 # Signal inheritance
 ATM_DELTA            = 0.50
-TARGET_RR            = 3.0
-MAX_RISK_POINTS      = 20   # tightened from 25 — prev-candle SL anchor; keeps max target at 60 pts
+TARGET_RR            = 1.5  # changed 3.0 → 1.5 (2026-06-10); base target only, runner mode unchanged
+MAX_RISK_POINTS      = 20   # prev-candle SL anchor; at TARGET_RR 1.5 → max target 30 pts
 
 # Entry gate
 VIX_MAX              = 22
