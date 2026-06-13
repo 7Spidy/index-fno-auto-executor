@@ -237,11 +237,17 @@ def _run_idle(
 
 
 def _journal_if_cooldown(r: redis_lib.Redis, gateway) -> None:
-    """Log trade to Notion + Discord when we've just entered COOLDOWN."""
+    """
+    Log trade to Notion + Discord once when we first enter COOLDOWN.
+    The notion_journaled flag prevents duplicate rows on subsequent runs
+    during the 15-minute cooldown window (executor runs every 1 minute).
+    """
     pos = state_module.load_position(r)
-    if pos and pos.get("phase") == "COOLDOWN":
+    if pos and pos.get("phase") == "COOLDOWN" and not pos.get("notion_journaled"):
         journal.log_trade_to_notion(pos)
         journal.notify_exit(pos)
+        pos["notion_journaled"] = True
+        state_module.save_position(r, pos)
 
 
 if __name__ == "__main__":
