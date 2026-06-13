@@ -36,12 +36,7 @@ def check_all(
     if not ok:
         return False, reason
 
-    # 2. MAX_RISK_POINTS ≤ 25
-    ok, reason = _check_risk_points(intent)
-    if not ok:
-        return False, reason
-
-    # 3. Cooldown — no new entry within COOLDOWN_CANDLES × 5 min of last signal
+    # 2. Cooldown — no new entry within COOLDOWN_CANDLES × 5 min of last signal
     ok, reason = _check_cooldown(r)
     if not ok:
         return False, reason
@@ -76,14 +71,6 @@ def _check_vix(kite: KiteClient) -> tuple[bool, str]:
     if vix > config.VIX_MAX:
         return False, f"VIX={vix:.1f} > {config.VIX_MAX} (hard block)"
     log.info("gate VIX=%.1f ≤ %d  OK", vix, config.VIX_MAX)
-    return True, ""
-
-
-def _check_risk_points(intent: dict) -> tuple[bool, str]:
-    rp = intent.get("spot_risk_pts", 0)
-    if rp > config.MAX_RISK_POINTS:
-        return False, f"spot_risk_pts={rp} > {config.MAX_RISK_POINTS} (wide candle)"
-    log.info("gate risk_pts=%.1f ≤ %d  OK", rp, config.MAX_RISK_POINTS)
     return True, ""
 
 
