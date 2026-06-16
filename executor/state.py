@@ -57,6 +57,25 @@ _KEY_LAST_SIG_TS  = "executor:last_signal_ts"
 _DAY_TTL_SECS     = 8 * 3600   # position key lives at most 8 hours (full trading day)
 
 
+def _loads_tolerant(raw: Any) -> Any:
+    """Decode a Redis JSON value, tolerating a double-encoded payload.
+
+    The signal bot (repo 1) writes the intent via the Upstash REST API and
+    json-encodes the body twice, so a single json.loads yields a str rather
+    than a dict. Unwrap successive string layers until we reach a container
+    (or the value stops being parseable).
+    """
+    val = json.loads(raw)
+    depth = 0
+    while isinstance(val, str) and depth < 3:
+        try:
+            val = json.loads(val)
+        except (ValueError, TypeError):
+            break
+        depth += 1
+    return val
+
+
 # ── Position ──────────────────────────────────────────────────────────────────
 
 def load_position(r: redis_lib.Redis) -> Optional[dict]:
@@ -81,7 +100,7 @@ def load_intent(r: redis_lib.Redis) -> Optional[dict]:
     raw = r.get(_KEY_INTENT)
     if not raw:
         return None
-    return json.loads(raw)
+    return _loads_tolerant(raw)
 
 
 def consume_intent(r: redis_lib.Redis) -> Optional[dict]:
@@ -93,7 +112,7 @@ def consume_intent(r: redis_lib.Redis) -> Optional[dict]:
     raw = r.get(_KEY_INTENT)
     if not raw:
         return None
-    intent = json.loads(raw)
+    intent = _loads_tolerant(raw)
     r.delete(_KEY_INTENT)
     r.set(_KEY_LAST_SIG_TS, intent.get("ts", ""), ex=_DAY_TTL_SECS)
     log.info("state: intent consumed ts=%s", intent.get("ts"))
@@ -105,7 +124,7 @@ def discard_intent(r: redis_lib.Redis, reason: str) -> None:
     raw = r.get(_KEY_INTENT)
     if not raw:
         return
-    intent = json.loads(raw)
+    intent = _loads_tolerant(raw)
     r.delete(_KEY_INTENT)
     r.set(_KEY_LAST_SIG_TS, intent.get("ts", ""), ex=_DAY_TTL_SECS)
     log.info("state: intent discarded reason=%s ts=%s", reason, intent.get("ts"))
