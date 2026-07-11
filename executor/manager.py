@@ -439,15 +439,27 @@ def check_exit_complete(
         if result.filled_price:
             pos["exit_premium"] = result.filled_price
 
-    # Compute P&L (paper only; live P&L from Kite statement)
+    # Compute P&L for both gateways
     entry  = pos.get("entry_premium", 0)
     exit_p = pos.get("exit_premium", entry)
     qty    = pos.get("qty", 0)
     from executor.gateway.paper import PaperGateway
-    if isinstance(gateway, PaperGateway) and qty > 0:
-        pnl = gateway.compute_pnl(entry, exit_p, qty)
-        pos["pnl"] = pnl
-        log.info("manager: paper P&L = ₹%.2f", pnl)
+    if qty > 0:
+        # Gross P&L (exit - entry) × qty. For live fills this is an
+        # approximation — it does not include actual Zerodha brokerage/STT/
+        # exchange charges (those come from the contract note, not
+        # available synchronously here). Good enough for a circuit-breaker
+        # trigger; do not treat this as the authoritative live P&L figure
+        # for accounting/journal purposes.
+        pnl = (exit_p - entry) * qty
+        pos["pnl"] = round(pnl, 2)
+        log.info("manager: P&L = ₹%.2f (paper=%s)", pnl, isinstance(gateway, PaperGateway))
+
+    date_str = now_ist().strftime("%Y-%m-%d")
+    new_pnl = state.update_daily_pnl(r, date_str, pos.get("pnl", 0.0) or 0.0)
+
+    if new_pnl <= config.DAILY_LOSS_LIMIT and not state.entries_blocked(r, date_str):
+        state.block_entries(r, date_str, f"daily_loss_breaker: pnl={new_pnl:.2f}")
 
     now_utc = state.now_utc_iso()
     pos["phase"]             = "COOLDOWN"

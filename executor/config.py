@@ -1,19 +1,20 @@
 # Frozen constants — v1.  Source of truth: fno-auto-executor-spec-v1.md §18.
 # Do NOT change any value without updating the spec and the FROZEN comment.
+# NOTE: DAILY_LOSS_PCT/DAILY_LOSS_LIMIT/PAPER_MODE are superseded by
+# claude_change_spec_repo2.md (live-phase daily-loss breaker) — see §18 note.
+
+import os
 
 # Instrument
 INSTRUMENT           = "NIFTY"
-USE_WEEKLY           = True          # Tuesday expiry
-STRIKE_STEP          = 50
 
 # Sizing
-CAPITAL_RS           = 1_00_000      # ₹1,00,000 paper capital
+CAPITAL_RS           = 1_00_000      # ₹1,00,000 capital (paper or live — see PAPER_MODE)
 RISK_PCT             = 0.02          # 2% per trade → ₹2,000 max risk
 
 # Signal inheritance
 ATM_DELTA            = 0.50
 TARGET_RR            = 1.5  # changed 3.0 → 1.5 (2026-06-10); base target only, runner mode unchanged
-MAX_RISK_POINTS      = 20   # prev-candle SL anchor; at TARGET_RR 1.5 → max target 30 pts
 
 # Entry gate
 VIX_MAX              = 22
@@ -50,9 +51,14 @@ NO_NEW_ENTRY         = "14:45"
 SQUAREOFF_IST        = "15:10"
 COOLDOWN_AFTER_EXIT  = 15           # minutes in COOLDOWN phase before IDLE
 
-# Daily limits — deferred to v2 (live phase)
+# Daily limits — v2 (live phase), ported from Repo 1 (src/paper_engine.py)
 MAX_TRADES_DAY       = None
-DAILY_LOSS_LIMIT     = None
+DAILY_LOSS_PCT       = 0.15
+DAILY_LOSS_LIMIT     = -(CAPITAL_RS * DAILY_LOSS_PCT)   # -15% of capital, computed
 
-# Mode — flip to False for live
-PAPER_MODE           = True
+# Mode — sourced from GitHub Actions repo/environment variable PAPER_MODE
+# ("true"/"false", case-insensitive). Defaults to True (safe) if unset.
+# This is the fallback default only — executor/run.py resolves the effective
+# mode per-tick as: Redis override (executor:paper_mode_override) > this env
+# var > this default. See executor/state.py get_paper_mode_override().
+PAPER_MODE           = os.environ.get("PAPER_MODE", "true").strip().lower() == "true"

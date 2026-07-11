@@ -324,11 +324,17 @@ Reuse from signal bot (copy, don't import cross-repo):
 
 ## 18. Frozen constants (v1)
 
+> **Updated by `claude_change_spec_repo2.md` (live phase):** `DAILY_LOSS_LIMIT`
+> is now computed as `-15%` of `CAPITAL_RS` (`DAILY_LOSS_PCT = 0.15`), and
+> `PAPER_MODE` is sourced from the `PAPER_MODE` env var (GitHub Actions
+> variable) instead of a hardcoded `True`. `USE_WEEKLY`, `STRIKE_STEP`, and
+> `MAX_RISK_POINTS` were removed as dead code — Repo 2 inherits `atm_strike`
+> verbatim from the signal intent and never recomputes strike/expiry or
+> checks a risk-points ceiling itself.
+
 ```python
 # Instrument
 INSTRUMENT          = "NIFTY"
-USE_WEEKLY          = True             # Tuesday expiry
-STRIKE_STEP         = 50
 
 # Sizing
 CAPITAL_RS          = 1_00_000         # paper
@@ -337,7 +343,6 @@ RISK_PCT            = 0.02             # 2% per trade → ₹2,000 max risk
 # Signal inheritance
 ATM_DELTA           = 0.50
 TARGET_RR           = 1.5
-MAX_RISK_POINTS     = 25
 
 # Entry gate
 VIX_MAX             = 22
@@ -374,12 +379,13 @@ NO_NEW_ENTRY        = "14:45"
 SQUAREOFF_IST       = "15:10"
 COOLDOWN_AFTER_EXIT = 15              # minutes before IDLE
 
-# Daily limits (deferred to v2 live)
+# Daily limits (v2 live)
 MAX_TRADES_DAY      = None
-DAILY_LOSS_LIMIT    = None
+DAILY_LOSS_PCT      = 0.15
+DAILY_LOSS_LIMIT    = -(CAPITAL_RS * DAILY_LOSS_PCT)   # -15% of capital
 
 # Mode
-PAPER_MODE          = True            # flip to False for live
+PAPER_MODE          = os.environ.get("PAPER_MODE", "true").strip().lower() == "true"
 ```
 
 ---

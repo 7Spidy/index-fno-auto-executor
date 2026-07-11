@@ -42,6 +42,11 @@ log = logging.getLogger("run")
 
 # ── Config overrides from environment ─────────────────────────────────────────
 # Allow CI to assert paper mode via env var even if config.PAPER_MODE = False.
+# Resolution order (highest precedence first), re-evaluated every tick since
+# each run is a fresh, stateless process:
+#   1. Redis key executor:paper_mode_override (set via state.set_paper_mode_override)
+#   2. PAPER_MODE env var / GitHub Actions repo variable
+#   3. config.PAPER_MODE default
 _PAPER_MODE = os.getenv("PAPER_MODE", str(config.PAPER_MODE)).lower() not in ("false", "0")
 
 
@@ -87,7 +92,7 @@ def _fetch_candles(kite: KiteClient, r: redis_lib.Redis) -> "pd.DataFrame":
 
 
 def main() -> None:
-    log.info("=== executor tick start mode=%s ===", "PAPER" if _PAPER_MODE else "LIVE")
+    global _PAPER_MODE
 
     # ── 1. Connect ─────────────────────────────────────────────────────────────
     try:
@@ -96,6 +101,13 @@ def main() -> None:
     except Exception as exc:
         log.error("startup failed: %s", exc)
         sys.exit(1)
+
+    # Redis override takes precedence over the env var, re-checked every tick.
+    override = state_module.get_paper_mode_override(r)
+    if override is not None:
+        _PAPER_MODE = override
+
+    log.info("=== executor tick start mode=%s ===", "PAPER" if _PAPER_MODE else "LIVE")
 
     # ── 2. Gateway ─────────────────────────────────────────────────────────────
     if _PAPER_MODE:

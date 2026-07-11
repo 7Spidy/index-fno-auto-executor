@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 
 import pytz
 
@@ -28,8 +28,3 @@ def last_completed_5min_open(now: datetime | None = None) -> datetime:
     t = (now or now_ist()).astimezone(IST)
     floored = t.replace(minute=(t.minute // 5) * 5, second=0, microsecond=0)
     return floored - timedelta(minutes=5)
-
-
-def is_past_time(hhmm: str) -> bool:
-    ref = ist_hhmm(hhmm)
-    return now_ist() >= ref

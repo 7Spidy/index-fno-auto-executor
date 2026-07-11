@@ -139,15 +139,6 @@ def notify_gate_fail(reason: str, intent: dict) -> None:
     _discord(msg)
 
 
-def notify_milestone(pos: dict, milestone: str) -> None:
-    msg = (
-        f"**[EXECUTOR] {milestone}** `{pos.get('tradingsymbol')}` "
-        f"sl=₹{pos.get('sl_premium', 0):.2f} "
-        f"peak=₹{pos.get('peak_premium', 0):.2f}"
-    )
-    _discord(msg)
-
-
 # ── Notion ─────────────────────────────────────────────────────────────────────
 
 def log_trade_to_notion(pos: dict) -> None:

@@ -8,16 +8,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any
 
 import pandas as pd
 from kiteconnect import KiteConnect
 
 log = logging.getLogger(__name__)
-
-# Exchange constants (avoids importing kiteconnect in every module)
-NFO   = "NFO"
-NSE   = "NSE"
 
 
 class KiteClient:
@@ -34,9 +29,6 @@ class KiteClient:
         """
         data = self._kite.ltp(instruments)
         return {k: v["last_price"] for k, v in data.items()}
-
-    def get_quote(self, instruments: list[str]) -> dict[str, Any]:
-        return self._kite.quote(instruments)
 
     def get_historical_candles(
         self,
@@ -74,9 +66,6 @@ class KiteClient:
 
     def cancel_order(self, variety: str, order_id: str) -> str:
         return self._kite.cancel_order(variety=variety, order_id=order_id)
-
-    def get_orders(self) -> list[dict]:
-        return self._kite.orders()
 
     def get_order_history(self, order_id: str) -> list[dict]:
         return self._kite.order_history(order_id)

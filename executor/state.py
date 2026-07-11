@@ -56,6 +56,12 @@ _KEY_INTENT       = "executor:pending_intent"
 _KEY_LAST_SIG_TS  = "executor:last_signal_ts"
 _DAY_TTL_SECS     = 8 * 3600   # position key lives at most 8 hours (full trading day)
 
+_KEY_DAILY_PNL_PREFIX   = "executor:daily_pnl:"      # + date_str (YYYY-MM-DD)
+_KEY_NO_MORE_PREFIX     = "executor:entries_blocked:" # + date_str
+_DAILY_KEY_TTL_SECS     = 86400
+
+_KEY_PAPER_MODE_OVERRIDE = "executor:paper_mode_override"
+
 
 def _loads_tolerant(raw: Any) -> Any:
     """Decode a Redis JSON value, tolerating a double-encoded payload.
@@ -185,3 +191,70 @@ def fresh_position_from_intent(intent: dict) -> dict:
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Daily-loss circuit breaker ──────────────────────────────────────────────────
+
+def _daily_pnl_key(date_str: str) -> str:
+    return f"{_KEY_DAILY_PNL_PREFIX}{date_str}"
+
+
+def _no_more_key(date_str: str) -> str:
+    return f"{_KEY_NO_MORE_PREFIX}{date_str}"
+
+
+def get_daily_pnl(r: redis_lib.Redis, date_str: str) -> float:
+    raw = r.get(_daily_pnl_key(date_str))
+    if not raw:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def update_daily_pnl(r: redis_lib.Redis, date_str: str, delta: float) -> float:
+    """Add delta to today's cumulative P&L and return the new total."""
+    new_val = get_daily_pnl(r, date_str) + delta
+    r.set(_daily_pnl_key(date_str), str(round(new_val, 2)), ex=_DAILY_KEY_TTL_SECS)
+    return new_val
+
+
+def entries_blocked(r: redis_lib.Redis, date_str: str) -> bool:
+    """True if the daily-loss breaker has tripped today."""
+    return r.exists(_no_more_key(date_str)) == 1
+
+
+def block_entries(r: redis_lib.Redis, date_str: str, reason: str) -> None:
+    r.set(_no_more_key(date_str), reason, ex=_DAILY_KEY_TTL_SECS)
+    log.info("entries BLOCKED for %s: %s", date_str, reason)
+
+
+def block_reason(r: redis_lib.Redis, date_str: str) -> Optional[str]:
+    raw = r.get(_no_more_key(date_str))
+    return raw.decode() if raw else None
+
+
+# ── PAPER_MODE runtime override ─────────────────────────────────────────────────
+
+def get_paper_mode_override(r: redis_lib.Redis) -> Optional[bool]:
+    """
+    Redis-backed runtime toggle for PAPER_MODE.  Returns None if no override is
+    set (caller should fall back to the PAPER_MODE env var / config default).
+    No TTL — persists until explicitly set or cleared.
+    """
+    raw = r.get(_KEY_PAPER_MODE_OVERRIDE)
+    if raw is None:
+        return None
+    val = raw.decode() if isinstance(raw, bytes) else raw
+    return val.strip().lower() == "true"
+
+
+def set_paper_mode_override(r: redis_lib.Redis, value: bool) -> None:
+    r.set(_KEY_PAPER_MODE_OVERRIDE, "true" if value else "false")
+    log.info("state: PAPER_MODE override set to %s", "PAPER" if value else "LIVE")
+
+
+def clear_paper_mode_override(r: redis_lib.Redis) -> None:
+    r.delete(_KEY_PAPER_MODE_OVERRIDE)
+    log.info("state: PAPER_MODE override cleared — falling back to env/config default")

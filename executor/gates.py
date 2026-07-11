@@ -27,9 +27,16 @@ def check_all(
     kite: KiteClient,
 ) -> tuple[bool, str]:
     """
-    Run all 6 entry gate checks in spec order.
+    Run all entry gate checks in spec order.
     Returns (True, "") on pass, or (False, reason_string) on first failure.
     """
+    from executor.state import entries_blocked, block_reason
+
+    # 0. Daily-loss circuit breaker — checked first, mirrors Repo 1
+    date_str = now_ist().strftime("%Y-%m-%d")
+    if entries_blocked(r, date_str):
+        reason = block_reason(r, date_str) or "entries blocked"
+        return False, reason
 
     # 1. VIX ≤ 22
     ok, reason = _check_vix(kite)
