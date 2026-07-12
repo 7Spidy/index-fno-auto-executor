@@ -178,11 +178,11 @@ def main() -> None:
         # Check if manage_position transitioned to EXITING this tick
         pos = state_module.load_position(r)
         if pos and pos.get("phase") == "EXITING":
-            manager.check_exit_complete(gateway, pos, r)
+            manager.check_exit_complete(gateway, pos, r, kite)
             _journal_if_cooldown(r, gateway)
 
     elif pos["phase"] == "EXITING":
-        manager.check_exit_complete(gateway, pos, r)
+        manager.check_exit_complete(gateway, pos, r, kite)
         _journal_if_cooldown(r, gateway)
 
     elif pos["phase"] == "COOLDOWN":
@@ -236,7 +236,7 @@ def _run_idle(
     if _PAPER_MODE and isinstance(gateway, PaperGateway):
         gateway.set_current_ltp(entry_ltp)
 
-    manager.try_enter(intent, gateway, r)
+    manager.try_enter(intent, gateway, r, kite, entry_ltp)
     journal.notify_entry(state_module.load_position(r) or {})
 
     # Immediately check fill (paper mode fills synchronously)

@@ -9,8 +9,8 @@ import os
 INSTRUMENT           = "NIFTY"
 
 # Sizing
-CAPITAL_RS           = 1_00_000      # ₹1,00,000 capital (paper or live — see PAPER_MODE)
-RISK_PCT             = 0.02          # 2% per trade → ₹2,000 max risk
+CAPITAL_RS           = 1_00_000      # Paper-mode fixed capital, mirrors Repo 1 DAILY_CAPITAL.
+                                       # Live mode uses kite.get_margins() instead — see sizing.py.
 
 # Signal inheritance
 ATM_DELTA            = 0.50
@@ -54,7 +54,8 @@ COOLDOWN_AFTER_EXIT  = 15           # minutes in COOLDOWN phase before IDLE
 # Daily limits — v2 (live phase), ported from Repo 1 (src/paper_engine.py)
 MAX_TRADES_DAY       = None
 DAILY_LOSS_PCT       = 0.15
-DAILY_LOSS_LIMIT     = -(CAPITAL_RS * DAILY_LOSS_PCT)   # -15% of capital, computed
+# DAILY_LOSS_LIMIT is no longer a static constant — live mode needs it computed
+# against real-time margins. Use sizing.get_daily_loss_limit(paper_mode, kite) instead.
 
 # Mode — sourced from GitHub Actions repo/environment variable PAPER_MODE
 # ("true"/"false", case-insensitive). Defaults to True (safe) if unset.

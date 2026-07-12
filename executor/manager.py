@@ -42,10 +42,12 @@ def try_enter(
     intent: dict,
     gateway: OrderGateway,
     r: redis_lib.Redis,
+    kite: "KiteClient",
+    entry_ltp: float,
 ) -> None:
     """
     Called when gate passes.  Places entry MARKET order and transitions to ENTERING.
-    Qty is computable from premium_risk (which does not depend on fill price).
+    Qty is fixed-lot, gated on capital availability (see sizing.compute_qty).
     In paper mode the order fills immediately; check_entry_fill() is called next.
     """
     ts = intent.get("tradingsymbol", "")
@@ -53,9 +55,12 @@ def try_enter(
 
     pos = state.fresh_position_from_intent(intent)
 
-    # Compute qty upfront — premium_risk = spot_risk_pts × ATM_DELTA (spec §5)
-    premium_risk = intent["spot_risk_pts"] * intent.get("atm_delta", config.ATM_DELTA)
-    qty = sizing.compute_qty(r, ts, premium_risk)
+    qty = sizing.compute_qty(
+        r, ts,
+        entry_ltp=entry_ltp,
+        paper_mode=config.PAPER_MODE,
+        kite=kite if not config.PAPER_MODE else None,
+    )
     if qty == 0:
         log.warning("manager: sizing returned 0 — aborting entry")
         return
@@ -422,6 +427,7 @@ def check_exit_complete(
     gateway: OrderGateway,
     pos: dict,
     r: redis_lib.Redis,
+    kite: "KiteClient",
 ) -> None:
     """Check if the position is now flat; transition to COOLDOWN if yes."""
     open_positions = gateway.get_open_positions()
@@ -458,7 +464,10 @@ def check_exit_complete(
     date_str = now_ist().strftime("%Y-%m-%d")
     new_pnl = state.update_daily_pnl(r, date_str, pos.get("pnl", 0.0) or 0.0)
 
-    if new_pnl <= config.DAILY_LOSS_LIMIT and not state.entries_blocked(r, date_str):
+    loss_limit = sizing.get_daily_loss_limit(
+        config.PAPER_MODE, kite if not config.PAPER_MODE else None, r,
+    )
+    if new_pnl <= loss_limit and not state.entries_blocked(r, date_str):
         state.block_entries(r, date_str, f"daily_loss_breaker: pnl={new_pnl:.2f}")
 
     now_utc = state.now_utc_iso()

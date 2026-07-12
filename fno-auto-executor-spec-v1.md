@@ -123,12 +123,17 @@ sl_premium     = entry_premium − premium_risk
 target_premium = entry_premium + (premium_risk × TARGET_RR)   # 1.5:1
 ```
 
-**Sizing:**
+**Sizing (fixed-lot, capital-availability — mirrors Repo 1's `paper_engine.py`):**
 ```
 lot_size = from Kite instrument master (fetched at morning-login, cached in Redis)
-max_lots = floor(CAPITAL_RS × RISK_PCT / (premium_risk × lot_size))
-qty      = max_lots × lot_size   (minimum 1 lot; if even 1 lot exceeds, skip)
+capital  = CAPITAL_RS (paper_mode=True) | kite.get_margins() (paper_mode=False, live)
+remaining = capital - committed_premium
+entry_cost = entry_ltp × lot_size
+qty      = lot_size (always 1 lot), or 0 (skip) if entry_cost > remaining
 ```
+> Changed 2026-07-12: dropped the risk-based `max_lots` scaling formula in favour of
+> a fixed 1-lot size gated only on capital availability, to match Repo 1 exactly.
+> See §11 and §18 for the updated `DAILY_LOSS_LIMIT` semantics.
 
 > **Target note:** flat 1.5:1 R:R (base target; changed 3.0 → 1.5 on 2026-06-10). Conviction is a display label only — does NOT scale target in v1. Conviction-scaled R:R is a documented v1.1 toggle, off by default.
 
@@ -197,16 +202,18 @@ If **15 minutes** since entry AND `progress < 0.25 × T` → trade isn't working
 
 ---
 
-## 11. Risk parameters (v1 — paper)
+## 11. Risk parameters (v2 — fixed-lot sizing, live-phase loss limit)
 
 ```
-CAPITAL_RS          = 1_00_000        # ₹1,00,000 paper capital
-RISK_PCT            = 0.02            # risk 2% of capital per trade = ₹2,000 max risk/trade
-MAX_TRADES_DAY      = None            # no limit (paper trade)
-DAILY_LOSS_LIMIT    = None            # no limit (paper trade)
+CAPITAL_RS          = 1_00_000        # paper-mode fixed capital (mirrors Repo 1 DAILY_CAPITAL)
+MAX_TRADES_DAY      = None            # no limit
+DAILY_LOSS_PCT      = 0.15            # -15% of capital
 ```
 
-Per-trade sizing is still capped by the `RISK_PCT × CAPITAL` formula — paper mode doesn't mean unlimited sizing. This keeps position sizing realistic for when you switch to live.
+Sizing is now fixed-lot (always 1 lot), gated on capital availability rather than a
+per-trade risk cap — see §5. `DAILY_LOSS_LIMIT` is no longer a static constant: it's
+computed via `sizing.get_daily_loss_limit(paper_mode, kite)`, using `CAPITAL_RS` in
+paper mode and live available margins (`kite.get_margins()`) in live mode.
 
 ---
 
@@ -331,14 +338,21 @@ Reuse from signal bot (copy, don't import cross-repo):
 > `MAX_RISK_POINTS` were removed as dead code — Repo 2 inherits `atm_strike`
 > verbatim from the signal intent and never recomputes strike/expiry or
 > checks a risk-points ceiling itself.
+>
+> **Updated 2026-07-12 (sizing/capital sync spec):** `RISK_PCT` and the
+> `max_lots` scaling formula are removed — sizing is now fixed-lot (1 lot),
+> gated on capital availability (§5, §11). `DAILY_LOSS_LIMIT` is no longer a
+> static module constant; it's computed via
+> `sizing.get_daily_loss_limit(paper_mode, kite)`, which uses `CAPITAL_RS` in
+> paper mode and `kite.get_margins()` (live available equity, short-TTL
+> Redis-cached) in live mode.
 
 ```python
 # Instrument
 INSTRUMENT          = "NIFTY"
 
 # Sizing
-CAPITAL_RS          = 1_00_000         # paper
-RISK_PCT            = 0.02             # 2% per trade → ₹2,000 max risk
+CAPITAL_RS          = 1_00_000         # paper-mode fixed capital; live mode uses kite.get_margins()
 
 # Signal inheritance
 ATM_DELTA           = 0.50
@@ -382,7 +396,8 @@ COOLDOWN_AFTER_EXIT = 15              # minutes before IDLE
 # Daily limits (v2 live)
 MAX_TRADES_DAY      = None
 DAILY_LOSS_PCT      = 0.15
-DAILY_LOSS_LIMIT    = -(CAPITAL_RS * DAILY_LOSS_PCT)   # -15% of capital
+# DAILY_LOSS_LIMIT: computed via sizing.get_daily_loss_limit(paper_mode, kite),
+# not a static constant — see note above.
 
 # Mode
 PAPER_MODE          = os.environ.get("PAPER_MODE", "true").strip().lower() == "true"

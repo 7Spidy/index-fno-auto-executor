@@ -14,6 +14,9 @@ from kiteconnect import KiteConnect
 
 log = logging.getLogger(__name__)
 
+KEY_MARGINS_CACHE = "kite:margins_cache"      # short-TTL cache — avoid hammering margins() per gate check
+MARGINS_CACHE_TTL_SECS = 60
+
 
 class KiteClient:
     def __init__(self, api_key: str, access_token: str) -> None:
@@ -55,6 +58,28 @@ class KiteClient:
         df.sort_values("date", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
+
+    def get_margins(self, r: "redis_lib.Redis | None" = None) -> float:
+        """
+        Return available equity cash for the live capital-availability gate.
+        Mirrors the capital figure semantics of Repo 1's DAILY_CAPITAL constant.
+
+        If a Redis client is passed, the result is cached for
+        MARGINS_CACHE_TTL_SECS to avoid calling margins() on every gate
+        evaluation within the same tick.
+        """
+        if r is not None:
+            cached = r.get(KEY_MARGINS_CACHE)
+            if cached is not None:
+                return float(cached)
+
+        margins = self._kite.margins()
+        available = float(margins["equity"]["available"]["live_balance"])
+
+        if r is not None:
+            r.set(KEY_MARGINS_CACHE, str(available), ex=MARGINS_CACHE_TTL_SECS)
+
+        return available
 
     # ── Order / position passthrough (used by KiteLiveGateway) ─────────────────
 

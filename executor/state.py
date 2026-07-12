@@ -100,6 +100,20 @@ def delete_position(r: redis_lib.Redis) -> None:
     log.info("state: position cleared")
 
 
+def committed_premium(r: redis_lib.Redis) -> float:
+    """
+    Sum of entry_price * qty for all currently-open executor positions.
+    Mirrors Repo 1's paper_engine._committed_premium(). Given Repo 2's
+    single-instrument, single-position-at-a-time gate (_check_no_open_position),
+    this will be 0 whenever try_enter() is reachable — implemented for parity
+    and to avoid silent divergence if multi-instrument support is added later.
+    """
+    pos = load_position(r)
+    if not pos:
+        return 0.0
+    return (pos.get("entry_premium") or 0.0) * (pos.get("qty") or 0)
+
+
 # ── Pending intent ─────────────────────────────────────────────────────────────
 
 def load_intent(r: redis_lib.Redis) -> Optional[dict]:
