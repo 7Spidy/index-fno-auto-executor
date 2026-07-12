@@ -81,17 +81,21 @@ executor/
 ├── trailing.py         ← Caution swing trail + monotonic ratchet invariant
 ├── sizing.py           ← Position sizing and level derivation
 ├── gates.py            ← Entry filters: VIX, cooldown, time, option tradable
-├── state.py            ← Redis R/W, idempotency, startup reconcile
+├── state.py            ← Redis R/W, idempotency, startup reconcile, committed_premium()
 ├── journal.py          ← Notion trade log + Discord P&L summary
 ├── gateway/
 │   ├── base.py         ← OrderGateway ABC
 │   ├── paper.py        ← Simulated fills + honest cost model
 │   └── kite_live.py    ← Real Kite Connect orders
 └── utils/
-    ├── kite_client.py  ← KiteConnect wrapper (market data)
+    ├── kite_client.py  ← KiteConnect wrapper (market data + get_margins())
     ├── indicators.py   ← VWAP, RSI, ATR, DMI
     ├── auth.py         ← Redis-backed token helpers
     └── calendar_nse.py ← IST utilities
+
+tests/
+├── test_sizing.py      ← compute_qty() / get_daily_loss_limit() coverage
+└── test_state.py       ← committed_premium() coverage
 ```
 
 ---
@@ -132,15 +136,22 @@ executor/
 
 ---
 
-## Risk parameters (v1 — paper)
+## Sizing & risk parameters (v2 — fixed-lot, capital-availability)
+
+Sizing is fixed-lot (always 1 lot, from the shared Kite instrument cache) gated on
+capital availability, matching the companion signal bot's `paper_engine.py` exactly:
+
+| Mode | Capital source | Daily loss limit |
+|------|----------------|-------------------|
+| Paper (`PAPER_MODE=True`) | Fixed ₹1,00,000 (`CAPITAL_RS`) | −15% of `CAPITAL_RS` |
+| Live (`PAPER_MODE=False`) | Real-time available margins (`kite.get_margins()`, short-TTL Redis cached) | −15% of live available margins |
 
 | Parameter | Value |
 |-----------|-------|
-| Capital | ₹1,00,000 (paper) |
-| Risk per trade | 2% → ₹2,000 max |
+| Lot size | 1 lot per instrument (auto-synced from the shared Redis instrument cache) |
 | Instrument | NIFTY weekly options (Tuesday expiry) |
 | Max positions | 1 at a time |
-| Daily loss limit | None (paper phase) |
+| Entry skipped if | `entry_ltp × lot_size` exceeds remaining capital |
 
 ---
 
