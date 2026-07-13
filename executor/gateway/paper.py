@@ -1,10 +1,12 @@
 """
-PaperGateway — simulated fills with honest cost model.
-Spec §15.  All paper order state lives in Redis under executor:paper_orders.
+PaperGateway — simulated fills with Repo 1's exact charges model.
+Spec §15.  All paper order state lives in Redis under executor:paper_orders,
+shared across all 17 concurrently-running instruments (claude_change_spec_repo2.md).
 
 Fill rules:
   MARKET  → fills immediately when set_current_ltp() has been called.
-  LIMIT   → SELL fills when LTP ≥ limit_price; BUY fills when LTP ≤ limit_price.
+  LIMIT   → SELL fills when LTP ≥ limit_price; BUY fills when LTP ≤ limit_price
+            (including instantly, at placement time, for a marketable BUY).
   SL-M    → SELL fills when LTP ≤ trigger_price; BUY fills when LTP ≥ trigger_price.
 Spread: buy at LTP + HALF_SPREAD, sell at LTP − HALF_SPREAD.
 """
@@ -21,6 +23,7 @@ import redis as redis_lib
 
 from executor.gateway.base import OrderGateway, OrderResult
 from executor import config
+from executor.charges import net_pnl
 
 log = logging.getLogger(__name__)
 
@@ -31,35 +34,22 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _paper_costs(sell_price: float, qty: int, lot_size: int) -> float:
-    """
-    Per-trade sell-side costs (spec §15):
-      brokerage ₹20, STT 0.025% of sell premium × qty,
-      exchange ~₹0.50/lot, GST 18% on brokerage + exchange.
-    """
-    lots = qty / lot_size
-    brokerage = 20.0
-    stt = 0.00025 * sell_price * qty
-    exchange = 0.50 * lots
-    gst = 0.18 * (brokerage + exchange)
-    return round(brokerage + stt + exchange + gst, 2)
-
-
 class PaperGateway(OrderGateway):
     """
     Implements OrderGateway using simulated fills stored in Redis.
-    Call set_current_ltp(ltp) once per executor run before any order operations.
-    Then call process_tick() to advance all pending orders against that LTP.
+    Call set_current_ltp(ltp) once per instrument, per executor run, before
+    any order operations for that instrument. Then call process_tick(),
+    scoped to that instrument's tradingsymbol, to advance its pending
+    LIMIT / SL-M orders against that LTP.
     """
 
     _ORDERS_KEY = "executor:paper_orders"
 
-    def __init__(self, redis_client: redis_lib.Redis, lot_size: int = 25) -> None:
+    def __init__(self, redis_client: redis_lib.Redis) -> None:
         self._r = redis_client
-        self._lot_size = lot_size
         self._current_ltp: Optional[float] = None
 
-    # ── LTP setter (called by run.py at start of each tick) ────────────────────
+    # ── LTP setter (called by run.py once per instrument, per tick) ────────────
 
     def set_current_ltp(self, ltp: float) -> None:
         self._current_ltp = ltp
@@ -127,6 +117,31 @@ class PaperGateway(OrderGateway):
             log.info("PAPER MARKET fill %s %s %s @ %.2f qty=%d",
                      oid, transaction_type, tradingsymbol, fill_price, quantity)
 
+        # A marketable LIMIT order (or an SL-M whose trigger is already
+        # touched) behaves like a market order when its condition is already
+        # satisfied at placement time — mirrors real exchange behavior and
+        # preserves the same-tick fill assumption _run_idle relies on.
+        elif order_type == "LIMIT" and price is not None and self._current_ltp is not None:
+            fills_now = (
+                (transaction_type == "BUY" and self._current_ltp <= price) or
+                (transaction_type == "SELL" and self._current_ltp >= price)
+            )
+            if fills_now:
+                fill_price = (
+                    self._current_ltp + HALF_SPREAD if transaction_type == "BUY"
+                    else self._current_ltp - HALF_SPREAD
+                )
+                fill_price = round(max(fill_price, 0.05), 2)
+                orders = self._load()
+                self._fill_order(orders[oid], fill_price)
+                self._save(orders)
+                log.info("PAPER LIMIT instant-fill %s %s %s @ %.2f qty=%d",
+                          oid, transaction_type, tradingsymbol, fill_price, quantity)
+            else:
+                log.info("PAPER placed %s %s %s qty=%d type=%s trigger=%s price=%s",
+                         oid, transaction_type, tradingsymbol, quantity,
+                         order_type, trigger_price, price)
+
         else:
             log.info("PAPER placed %s %s %s qty=%d type=%s trigger=%s price=%s",
                      oid, transaction_type, tradingsymbol, quantity,
@@ -178,51 +193,66 @@ class PaperGateway(OrderGateway):
         )
 
     def get_open_positions(self) -> list[dict]:
-        """Derive net open positions from filled order pairs."""
+        """Derive net open positions, one per distinct tradingsymbol, from
+        filled order pairs. Must not blend fills across different
+        instruments — 17 instruments can have concurrently open positions,
+        each with its own filled BUY/SELL orders in the same shared store."""
         orders = self._load()
-        buy_fills  = [o for o in orders.values()
-                      if o["transaction_type"] == "BUY"  and o["status"] == "COMPLETE"]
-        sell_fills = [o for o in orders.values()
-                      if o["transaction_type"] == "SELL" and o["status"] == "COMPLETE"]
-        buy_qty  = sum(o["filled_qty"] for o in buy_fills)
-        sell_qty = sum(o["filled_qty"] for o in sell_fills)
-        net_qty = buy_qty - sell_qty
-        if net_qty <= 0 or not buy_fills:
-            return []
-        avg_price = sum(o["filled_price"] * o["filled_qty"] for o in buy_fills) / buy_qty
-        return [{
-            "tradingsymbol": buy_fills[-1]["tradingsymbol"],
-            "product": "MIS",
-            "quantity": net_qty,
-            "average_price": round(avg_price, 2),
-        }]
+        by_symbol: dict[str, dict] = {}
+        for o in orders.values():
+            if o["status"] != "COMPLETE":
+                continue
+            sym = o["tradingsymbol"]
+            entry = by_symbol.setdefault(sym, {"buy_qty": 0, "sell_qty": 0, "buy_notional": 0.0})
+            if o["transaction_type"] == "BUY":
+                entry["buy_qty"] += o["filled_qty"]
+                entry["buy_notional"] += o["filled_price"] * o["filled_qty"]
+            elif o["transaction_type"] == "SELL":
+                entry["sell_qty"] += o["filled_qty"]
+
+        result = []
+        for sym, e in by_symbol.items():
+            net_qty = e["buy_qty"] - e["sell_qty"]
+            if net_qty <= 0 or e["buy_qty"] == 0:
+                continue
+            avg_price = e["buy_notional"] / e["buy_qty"]
+            result.append({
+                "tradingsymbol": sym,
+                "product": "MIS",
+                "quantity": net_qty,
+                "average_price": round(avg_price, 2),
+            })
+        return result
 
     def reconcile(self, position_state: dict) -> dict:
         """
-        Check if paper SL or target orders were filled externally (via process_tick
+        Check if the paper SL order was filled externally (via process_tick
         in a previous run that crashed before updating Redis position state).
-        Marks sl_filled / target_filled flags if applicable.
+        Marks the sl_filled flag if applicable.
         """
-        for key, fill_key in [("sl_order_id", "sl_filled"),
-                               ("target_order_id", "target_filled")]:
-            oid = position_state.get(key)
-            if not oid:
-                continue
+        oid = position_state.get("sl_order_id")
+        if oid:
             result = self.get_order_status(oid)
-            if result.status == "COMPLETE" and not position_state.get(fill_key):
-                position_state[fill_key] = True
-                price_key = "sl_fill_price" if key == "sl_order_id" else "target_fill_price"
-                position_state[price_key] = result.filled_price
-                log.warning("PAPER reconcile: %s was already filled @ %.2f",
-                            key, result.filled_price or 0)
+            if result.status == "COMPLETE" and not position_state.get("sl_filled"):
+                position_state["sl_filled"] = True
+                position_state["sl_fill_price"] = result.filled_price
+                log.warning("PAPER reconcile: sl_order_id was already filled @ %.2f",
+                            result.filled_price or 0)
         return position_state
 
     # ── Tick processor (called every executor run for pending LIMIT / SL-M orders) ─
 
-    def process_tick(self) -> list[str]:
+    def process_tick(self, tradingsymbol: Optional[str] = None) -> list[str]:
         """
-        Advance all OPEN non-MARKET paper orders against self._current_ltp.
-        Returns list of order_ids filled this tick.
+        Advance OPEN non-MARKET paper orders against self._current_ltp.
+
+        `tradingsymbol`, when given, scopes this call to only that
+        instrument's orders — required because executor:paper_orders is a
+        single store shared across all 17 concurrently-ticking instruments,
+        each with its own LTP; without this filter, one instrument's LTP
+        would incorrectly evaluate every other instrument's pending orders.
+
+        Returns list of order_ids filled this call.
         """
         if self._current_ltp is None:
             return []
@@ -232,6 +262,8 @@ class PaperGateway(OrderGateway):
 
         for oid, o in orders.items():
             if o["status"] != "OPEN":
+                continue
+            if tradingsymbol is not None and o["tradingsymbol"] != tradingsymbol:
                 continue
             ot = o["order_type"]
             tt = o["transaction_type"]
@@ -261,11 +293,9 @@ class PaperGateway(OrderGateway):
 
     # ── P&L helper ─────────────────────────────────────────────────────────────
 
-    def compute_pnl(self, entry_price: float, exit_price: float, qty: int) -> float:
-        """Net P&L after costs (one-way sell-side costs per trade)."""
-        gross = (exit_price - entry_price) * qty
-        costs = _paper_costs(exit_price, qty, self._lot_size)
-        return round(gross - costs, 2)
+    def compute_pnl(self, entry_price: float, exit_price: float, qty: int, direction: str) -> float:
+        """Net P&L via Repo 1's exact charges model — see executor/charges.py."""
+        return net_pnl(entry_price, exit_price, qty, direction)
 
     # ── Internal ───────────────────────────────────────────────────────────────
 

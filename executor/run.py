@@ -1,19 +1,24 @@
 """
-run.py — GH Actions entrypoint.  One complete tick per invocation.  Spec §0, §2.
+run.py — GH Actions entrypoint.  One complete tick per invocation, looping
+all 17 instruments (3 indices + 14 stocks — see executor/instruments.py).
 
 Flow:
-  1. Connect Redis + build KiteClient (uses token from morning-login.yml).
-  2. Build gateway (paper or live).
-  3. Fetch option LTP + NIFTY spot.
-  4. Advance paper orders to current LTP (process_tick).
-  5. Load position from Redis; run startup reconcile.
-  6. Hard square-off guard (15:10 IST).
-  7. Route by phase:
-       IDLE / no position   → check pending_intent → run entry gate → try_enter
-       ENTERING             → check_entry_fill
-       OPEN_FIXED/LOCKED/RUNNER → manage_position
-       EXITING              → check_exit_complete
-       COOLDOWN             → check_cooldown_elapsed
+  1. Connect Redis + build KiteClient (token from Repo 1's shared kite:* cache
+     written by Repo 1's morning-login.yml — see executor/utils/auth.py).
+  2. Build gateway (paper or live) — one instance shared across all 17
+     instruments this tick.
+  3. For each instrument:
+       Fetch option LTP + underlying spot/futures LTP.
+       Advance paper orders for this instrument's tradingsymbol only.
+       Load position from Redis; run startup reconcile.
+       Hard square-off guard (15:10 IST) — per instrument.
+       Route by phase:
+         IDLE / no position   → check pending_intent → run entry gate → try_enter
+         ENTERING             → check_entry_fill (+ bounded same-tick retry)
+         OPEN                 → manage_position
+         EXITING              → check_exit_complete
+         COOLDOWN             → check_cooldown_elapsed
+     One instrument's failure must never block the other 16.
 """
 
 from __future__ import annotations
@@ -21,7 +26,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+import time
+from datetime import datetime, timedelta
 
 import redis as redis_lib
 
@@ -31,6 +37,7 @@ from executor.gateway.paper import PaperGateway
 from executor.gateway.kite_live import KiteLiveGateway
 from executor.utils import auth
 from executor.utils.calendar_nse import now_ist, ist_hhmm, IST
+from executor.utils.indicators import compute_rsi
 from executor.utils.kite_client import KiteClient
 
 logging.basicConfig(
@@ -74,21 +81,29 @@ def _build_kite(r: redis_lib.Redis) -> KiteClient:
     return KiteClient(api_key=api_key, access_token=access_token)
 
 
-def _fetch_candles(kite: KiteClient, r: redis_lib.Redis) -> "pd.DataFrame":
-    """Fetch last 20 5-min NIFTY spot candles ending now."""
-    import pandas as pd
-    from datetime import timedelta
-    now = datetime.now(IST)
-    from_dt = now - timedelta(hours=3)   # enough to cover 20 × 5-min candles
-    token = auth.get_nifty_spot_token(r)
+def _get_rsi_snapshot(kite: KiteClient, r: redis_lib.Redis, instrument: str) -> list[float] | None:
+    """Port of Repo 1's position_tracker._get_rsi_snapshot: fetch OHLCV via
+    the instrument's underlying token, compute RSI, take the last 3 values.
+
+    Used only by the ladder's compute_ai_adjusted_sl — a fetch failure here
+    just means the AI-adjusted tightening is skipped this tick (the ladder
+    SL itself does not depend on RSI).
+    """
     try:
+        token = auth.get_underlying_token(r, instrument)
+        now = datetime.now(IST)
+        from_dt = now - timedelta(days=5)   # warm-up for RSI(14) across weekends/holidays
         df = kite.get_historical_candles(token, from_dt, now, interval="5minute")
-        if len(df) > 20:
-            df = df.iloc[-20:].reset_index(drop=True)
-        return df
+        if df.empty:
+            return None
+        rsi_series = compute_rsi(df["close"])
+        last3 = rsi_series.dropna().iloc[-3:]
+        if len(last3) < 3:
+            return None
+        return list(last3)
     except Exception as exc:
-        log.warning("_fetch_candles: failed (%s) — returning empty DataFrame", exc)
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        log.warning("_get_rsi_snapshot(%s): %s", instrument, exc)
+        return None
 
 
 def main() -> None:
@@ -109,157 +124,188 @@ def main() -> None:
 
     log.info("=== executor tick start mode=%s ===", "PAPER" if _PAPER_MODE else "LIVE")
 
-    # ── 2. Gateway ─────────────────────────────────────────────────────────────
+    # ── 2. Gateway — one shared instance for all 17 instruments this tick ──────
     if _PAPER_MODE:
-        lot_size = auth.get_lot_size(r, config.INSTRUMENT)
-        gateway = PaperGateway(r, lot_size)
+        gateway = PaperGateway(r)
     else:
         gateway = KiteLiveGateway(kite)
 
-    # ── 3. Market data ─────────────────────────────────────────────────────────
-    pos = state_module.load_position(r)
+    now = now_ist()
+    squareoff_time = ist_hhmm(config.SQUAREOFF_IST, now)
+    past_squareoff = now >= squareoff_time
+
+    # ── 3. Loop all 17 instruments ──────────────────────────────────────────────
+    for inst_cfg in config.INDICES + config.STOCKS:
+        instrument = inst_cfg["name"]
+        exchange   = inst_cfg.get("fno_exchange", "NFO")
+        try:
+            _run_one_instrument(r, kite, gateway, instrument, exchange, past_squareoff)
+        except Exception as exc:
+            # One instrument's failure must never block the other 16 —
+            # mirrors Repo 1 main.py's per-instrument exception isolation.
+            log.error("instrument %s tick failed: %s", instrument, exc)
+
+    log.info("=== executor tick end ===")
+
+
+def _run_one_instrument(
+    r: redis_lib.Redis,
+    kite: KiteClient,
+    gateway,
+    instrument: str,
+    exchange: str,
+    past_squareoff: bool,
+) -> None:
+    pos = state_module.load_position(r, instrument)
     tradingsymbol = pos["tradingsymbol"] if pos else None
 
     option_ltp: float = 0.0
     spot_ltp: float   = 0.0
 
     try:
-        nifty_ltp_map = kite.get_ltp(["NSE:NIFTY 50"])
-        spot_ltp = nifty_ltp_map.get("NSE:NIFTY 50", 0.0)
+        underlying_token = auth.get_underlying_token(r, instrument)
+        spot_map = kite.get_ltp([str(underlying_token)])
+        spot_ltp = spot_map.get(str(underlying_token), 0.0)
     except Exception as exc:
-        log.error("NIFTY spot LTP fetch failed: %s", exc)
+        log.error("%s: underlying LTP fetch failed: %s", instrument, exc)
 
     if tradingsymbol:
         try:
-            opt_map    = kite.get_ltp([f"NFO:{tradingsymbol}"])
-            option_ltp = opt_map.get(f"NFO:{tradingsymbol}", 0.0)
+            opt_map    = kite.get_ltp([f"{exchange}:{tradingsymbol}"])
+            option_ltp = opt_map.get(f"{exchange}:{tradingsymbol}", 0.0)
         except Exception as exc:
-            log.error("option LTP fetch failed for %s: %s", tradingsymbol, exc)
+            log.error("%s: option LTP fetch failed for %s: %s", instrument, tradingsymbol, exc)
 
-    # ── 4. Advance paper orders ────────────────────────────────────────────────
-    if _PAPER_MODE and isinstance(gateway, PaperGateway):
+    # ── Advance paper orders for THIS instrument's tradingsymbol only ──────────
+    if isinstance(gateway, PaperGateway):
         if option_ltp > 0:
             gateway.set_current_ltp(option_ltp)
-        filled = gateway.process_tick()
-        if filled:
-            log.info("paper tick: filled orders %s", filled)
+            filled = gateway.process_tick(tradingsymbol)
+            if filled:
+                log.info("%s: paper tick filled orders %s", instrument, filled)
 
-    # ── 5. Reload position + reconcile ─────────────────────────────────────────
-    pos = state_module.load_position(r)
-    if pos and pos["phase"] in ("OPEN_FIXED", "LOCKED", "RUNNER", "ENTERING"):
+    # ── Reload position + reconcile ─────────────────────────────────────────
+    pos = state_module.load_position(r, instrument)
+    if pos and pos["phase"] in ("OPEN", "ENTERING"):
         pos = gateway.reconcile(pos)
-        state_module.save_position(r, pos)
+        state_module.save_position(r, instrument, pos)
 
-    # ── 6. Hard square-off guard ───────────────────────────────────────────────
-    now = now_ist()
-    squareoff_time = ist_hhmm(config.SQUAREOFF_IST, now)
-    if now >= squareoff_time:
-        if pos and pos.get("phase") in ("OPEN_FIXED", "LOCKED", "RUNNER", "ENTERING"):
-            log.warning("past %s — hard squareoff", config.SQUAREOFF_IST)
+    # ── Hard square-off guard ───────────────────────────────────────────────
+    if past_squareoff:
+        if pos and pos.get("phase") in ("OPEN", "ENTERING"):
+            log.warning("%s: past %s — hard squareoff", instrument, config.SQUAREOFF_IST)
             manager.force_squareoff(gateway, pos, r, option_ltp=option_ltp)
-            pos = state_module.load_position(r)
+            pos = state_module.load_position(r, instrument)
         else:
-            log.info("past %s, no open position — nothing to do", config.SQUAREOFF_IST)
+            log.info("%s: past %s, no open position — nothing to do", instrument, config.SQUAREOFF_IST)
             return
 
-    # ── 7. Phase routing ───────────────────────────────────────────────────────
+    # ── Phase routing ───────────────────────────────────────────────────────
     if pos is None or pos.get("phase") in (None, "IDLE"):
-        _run_idle(r, kite, gateway, option_ltp, spot_ltp)
+        _run_idle(r, kite, gateway, instrument, exchange, option_ltp, spot_ltp)
 
     elif pos["phase"] == "ENTERING":
         manager.check_entry_fill(gateway, pos, r, spot_ltp, option_ltp)
 
-    elif pos["phase"] in ("OPEN_FIXED", "LOCKED", "RUNNER"):
+    elif pos["phase"] == "OPEN":
         if option_ltp <= 0:
-            log.error("option LTP unavailable — skipping management tick")
+            log.error("%s: option LTP unavailable — skipping management tick", instrument)
             return
-        candles = _fetch_candles(kite, r)
-        manager.manage_position(gateway, pos, r, option_ltp, spot_ltp, candles)
+        rsi_last3 = _get_rsi_snapshot(kite, r, instrument)
+        manager.manage_position(gateway, pos, r, option_ltp, rsi_last3)
         # Check if manage_position transitioned to EXITING this tick
-        pos = state_module.load_position(r)
+        pos = state_module.load_position(r, instrument)
         if pos and pos.get("phase") == "EXITING":
             manager.check_exit_complete(gateway, pos, r, kite)
-            _journal_if_cooldown(r, gateway)
+            _journal_if_cooldown(r, instrument)
 
     elif pos["phase"] == "EXITING":
         manager.check_exit_complete(gateway, pos, r, kite)
-        _journal_if_cooldown(r, gateway)
+        _journal_if_cooldown(r, instrument)
 
     elif pos["phase"] == "COOLDOWN":
         manager.check_cooldown_elapsed(pos, r)
-
-    log.info("=== executor tick end ===")
 
 
 def _run_idle(
     r: redis_lib.Redis,
     kite: KiteClient,
     gateway,
+    instrument: str,
+    exchange: str,
     option_ltp: float,
     spot_ltp: float,
 ) -> None:
     """Check for pending intent; run entry gate; enter if passes."""
-    intent = state_module.load_intent(r)
+    intent = state_module.load_intent(r, instrument)
     if not intent:
-        log.info("idle: no pending intent")
+        log.info("%s: idle: no pending intent", instrument)
         return
 
-    log.info("idle: pending intent found ts=%s sym=%s",
-             intent.get("ts"), intent.get("tradingsymbol"))
+    log.info("%s: idle: pending intent found ts=%s sym=%s",
+             instrument, intent.get("ts"), intent.get("tradingsymbol"))
 
-    ok, reason = gates.check_all(intent, r, kite)
+    ok, reason = gates.check_all(intent, r, kite, exchange)
     if not ok:
-        log.info("gate FAIL: %s", reason)
-        state_module.discard_intent(r, reason)
+        log.info("%s: gate FAIL: %s", instrument, reason)
+        state_module.discard_intent(r, instrument, reason)
         journal.notify_gate_fail(reason, intent)
         return
 
-    log.info("gate PASS — entering")
-    consumed = state_module.consume_intent(r)
+    log.info("%s: gate PASS — entering", instrument)
+    consumed = state_module.consume_intent(r, instrument)
     if not consumed:
-        log.warning("idle: intent vanished between gate check and consume — skipping")
+        log.warning("%s: idle: intent vanished between gate check and consume — skipping", instrument)
         return
 
-    # Fetch option LTP for the intent symbol (needed for MARKET fill price)
+    # Fetch option LTP for the intent symbol (needed for marketable-LIMIT price)
     ts = intent.get("tradingsymbol", "")
     try:
-        ltp_map = kite.get_ltp([f"NFO:{ts}"])
-        entry_ltp = ltp_map.get(f"NFO:{ts}", 0.0)
+        ltp_map = kite.get_ltp([f"{exchange}:{ts}"])
+        entry_ltp = ltp_map.get(f"{exchange}:{ts}", 0.0)
     except Exception as exc:
-        log.error("entry LTP fetch failed for %s: %s", ts, exc)
+        log.error("%s: entry LTP fetch failed for %s: %s", instrument, ts, exc)
         return
 
     if entry_ltp <= 0:
-        log.error("entry LTP is 0 for %s — aborting", ts)
+        log.error("%s: entry LTP is 0 for %s — aborting", instrument, ts)
         return
 
-    if _PAPER_MODE and isinstance(gateway, PaperGateway):
+    if isinstance(gateway, PaperGateway):
         gateway.set_current_ltp(entry_ltp)
 
-    manager.try_enter(intent, gateway, r, kite, entry_ltp)
-    journal.notify_entry(state_module.load_position(r) or {})
+    manager.try_enter(intent, gateway, r, kite, entry_ltp, exchange)
+    journal.notify_entry(state_module.load_position(r, instrument) or {})
 
-    # Immediately check fill (paper mode fills synchronously)
-    pos = state_module.load_position(r)
+    # Bounded same-tick retry on the fill check — the marketable-LIMIT entry
+    # may not register as filled at the instant try_enter places it; without
+    # this, the position would sit with no SL until the *next* cron tick (up
+    # to ~1 minute later).
+    pos = state_module.load_position(r, instrument)
     if pos and pos["phase"] == "ENTERING":
-        manager.check_entry_fill(gateway, pos, r, spot_ltp, entry_ltp)
-        pos = state_module.load_position(r)
-        if pos and pos["phase"] == "OPEN_FIXED":
+        for attempt in range(config.ENTRY_FILL_RETRY_ATTEMPTS):
+            manager.check_entry_fill(gateway, pos, r, spot_ltp, entry_ltp)
+            pos = state_module.load_position(r, instrument)
+            if not pos or pos.get("phase") != "ENTERING":
+                break
+            if attempt < config.ENTRY_FILL_RETRY_ATTEMPTS - 1:
+                time.sleep(config.ENTRY_FILL_RETRY_DELAY_SECS)
+        if pos and pos.get("phase") == "OPEN":
             journal.notify_entry(pos)
 
 
-def _journal_if_cooldown(r: redis_lib.Redis, gateway) -> None:
+def _journal_if_cooldown(r: redis_lib.Redis, instrument: str) -> None:
     """
     Log trade to Notion + Discord once when we first enter COOLDOWN.
     The notion_journaled flag prevents duplicate rows on subsequent runs
     during the 15-minute cooldown window (executor runs every 1 minute).
     """
-    pos = state_module.load_position(r)
+    pos = state_module.load_position(r, instrument)
     if pos and pos.get("phase") == "COOLDOWN" and not pos.get("notion_journaled"):
         journal.log_trade_to_notion(pos)
         journal.notify_exit(pos)
         pos["notion_journaled"] = True
-        state_module.save_position(r, pos)
+        state_module.save_position(r, instrument, pos)
 
 
 if __name__ == "__main__":

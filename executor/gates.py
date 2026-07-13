@@ -1,5 +1,5 @@
 """
-Entry gate — spec §4.  All six conditions must pass; if any fails the intent is
+Entry gate — spec §4.  All conditions must pass; if any fails the intent is
 discarded (not retried) and the gate returns (False, reason).
 """
 
@@ -17,14 +17,12 @@ from executor.utils.kite_client import KiteClient
 
 log = logging.getLogger(__name__)
 
-# India VIX on NSE — Kite symbol
-_VIX_INSTRUMENT = "NSE:INDIA VIX"
-
 
 def check_all(
     intent: dict,
     r: redis_lib.Redis,
     kite: KiteClient,
+    exchange: str,
 ) -> tuple[bool, str]:
     """
     Run all entry gate checks in spec order.
@@ -38,29 +36,27 @@ def check_all(
         reason = block_reason(r, date_str) or "entries blocked"
         return False, reason
 
-    # 1. VIX ≤ 22
-    ok, reason = _check_vix(kite)
+    # 1. Cooldown — no new entry within COOLDOWN_CANDLES × 5 min of last signal
+    #    for THIS instrument (mirrors Repo 1's per-instrument cooldown:{name}:{direction}
+    #    key in main.py/stock_main.py — cooldown is not global across instruments).
+    ok, reason = _check_cooldown(r, intent.get("instrument", ""))
     if not ok:
         return False, reason
 
-    # 2. Cooldown — no new entry within COOLDOWN_CANDLES × 5 min of last signal
-    ok, reason = _check_cooldown(r)
+    # 2. No open position for this instrument (caller already checks
+    #    executor:position:{instrument} is absent, but we double-check here
+    #    for safety)
+    ok, reason = _check_no_open_position(r, intent.get("instrument", ""))
     if not ok:
         return False, reason
 
-    # 4. No open position  (caller already checks executor:position is absent,
-    #    but we double-check here for safety)
-    ok, reason = _check_no_open_position(r)
-    if not ok:
-        return False, reason
-
-    # 5. Time window + intent freshness
+    # 3. Time window + intent freshness
     ok, reason = _check_time(intent)
     if not ok:
         return False, reason
 
-    # 6. Option tradable
-    ok, reason = _check_option_tradable(intent, r, kite)
+    # 4. Option tradable
+    ok, reason = _check_option_tradable(intent, r, kite, exchange)
     if not ok:
         return False, reason
 
@@ -69,21 +65,9 @@ def check_all(
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
-def _check_vix(kite: KiteClient) -> tuple[bool, str]:
-    try:
-        ltp_map = kite.get_ltp([_VIX_INSTRUMENT])
-        vix = ltp_map.get(_VIX_INSTRUMENT, 0.0)
-    except Exception as exc:
-        return False, f"VIX fetch failed: {exc}"
-    if vix > config.VIX_MAX:
-        return False, f"VIX={vix:.1f} > {config.VIX_MAX} (hard block)"
-    log.info("gate VIX=%.1f ≤ %d  OK", vix, config.VIX_MAX)
-    return True, ""
-
-
-def _check_cooldown(r: redis_lib.Redis) -> tuple[bool, str]:
+def _check_cooldown(r: redis_lib.Redis, instrument: str) -> tuple[bool, str]:
     from executor.state import get_last_signal_ts
-    last_ts_str = get_last_signal_ts(r)
+    last_ts_str = get_last_signal_ts(r, instrument)
     if not last_ts_str:
         return True, ""
     try:
@@ -101,9 +85,9 @@ def _check_cooldown(r: redis_lib.Redis) -> tuple[bool, str]:
     return True, ""
 
 
-def _check_no_open_position(r: redis_lib.Redis) -> tuple[bool, str]:
+def _check_no_open_position(r: redis_lib.Redis, instrument: str) -> tuple[bool, str]:
     from executor.state import load_position
-    pos = load_position(r)
+    pos = load_position(r, instrument)
     if pos and pos.get("phase") not in (None, "COOLDOWN"):
         return False, f"position already open (phase={pos.get('phase')})"
     return True, ""
@@ -137,14 +121,15 @@ def _check_option_tradable(
     intent: dict,
     r: redis_lib.Redis,
     kite: KiteClient,
+    exchange: str,
 ) -> tuple[bool, str]:
     ts = intent.get("tradingsymbol", "")
     if not ts:
         return False, "tradingsymbol missing from intent"
 
-    # Check instrument exists in token cache
+    # Check instrument exists in the shared token cache
     try:
-        token_cache = auth.get_option_token_cache(r)
+        token_cache = auth.get_option_cache(r)
     except RuntimeError as exc:
         return False, str(exc)
 
@@ -153,8 +138,8 @@ def _check_option_tradable(
 
     # Check LTP is non-zero
     try:
-        ltp_map = kite.get_ltp([f"NFO:{ts}"])
-        ltp = ltp_map.get(f"NFO:{ts}", 0.0)
+        ltp_map = kite.get_ltp([f"{exchange}:{ts}"])
+        ltp = ltp_map.get(f"{exchange}:{ts}", 0.0)
     except Exception as exc:
         return False, f"LTP fetch for {ts} failed: {exc}"
 

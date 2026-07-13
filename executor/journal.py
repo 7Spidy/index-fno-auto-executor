@@ -29,16 +29,9 @@ _IST             = ZoneInfo("Asia/Kolkata")
 # Maps internal exit_reason codes → Notion select option names (must match DB exactly)
 
 _EXIT_REASON_MAP: dict[str, str] = {
-    "target_hit":          "Target",
-    "sl_hit":              "SL Hit",
-    "runner_giveback":     "Runner Trail",
-    "runner_health_faded": "Health Exit",
-    "health_exit":         "Health Exit",
-    "reversal":            "Health Exit",
-    "vwap_lost":           "VWAP Exit",
-    "theta":               "Theta",
-    "hard_squareoff":      "Square-off",
-    "squareoff":           "Square-off",
+    "sl_hit":         "SL Hit",
+    "hard_squareoff": "Square-off",
+    "flat_external":  "Square-off",  # position closed outside the executor's own orders
 }
 
 
@@ -111,7 +104,6 @@ def notify_entry(pos: dict) -> None:
         f"dir={pos.get('direction')} "
         f"entry=₹{pos.get('entry_premium', 0):.2f} "
         f"sl=₹{pos.get('sl_premium', 0):.2f} "
-        f"target=₹{pos.get('target_premium', 0):.2f} "
         f"qty={pos.get('qty')} "
         f"({mode})"
     )

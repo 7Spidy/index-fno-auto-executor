@@ -2,14 +2,15 @@
 # Do NOT change any value without updating the spec and the FROZEN comment.
 # NOTE: DAILY_LOSS_PCT/DAILY_LOSS_LIMIT/PAPER_MODE are superseded by
 # claude_change_spec_repo2.md (live-phase daily-loss breaker) — see §18 note.
+# NOTE: instrument universe, ladder SL, and Repo 1 charges parity are per
+# the 17-instrument claude_change_spec_repo2.md rewrite — see that file.
 
 import os
 
-# Instrument
-INSTRUMENT           = "NIFTY"
+from executor.instruments import INDICES, STOCKS, ALL_INSTRUMENT_NAMES  # noqa: F401 — re-exported for config.INDICES/STOCKS/ALL_INSTRUMENT_NAMES callers (e.g. run.py)
 
 # Sizing
-CAPITAL_RS           = 1_00_000      # Paper-mode fixed capital, mirrors Repo 1 DAILY_CAPITAL.
+CAPITAL_RS           = 50_000        # Paper-mode fixed capital, mirrors Repo 1 DAILY_CAPITAL.
                                        # Live mode uses kite.get_margins() instead — see sizing.py.
 
 # Signal inheritance
@@ -17,30 +18,15 @@ ATM_DELTA            = 0.50
 TARGET_RR            = 1.5  # changed 3.0 → 1.5 (2026-06-10); base target only, runner mode unchanged
 
 # Entry gate
-VIX_MAX              = 22
 COOLDOWN_CANDLES     = 3             # × 5 min = 15 min
 INTENT_TTL_MIN       = 6
 
-# Health score
-HEALTH_WEIGHTS       = {"C2_vwap": 40, "C4_dmi": 25, "C3_rsi": 20, "C1_mom": 15}
-HEALTH_HEALTHY       = 75
-HEALTH_CAUTION       = 50
-VWAP_LOST_EXIT       = 2            # consecutive 5-min candles
-
-# Milestones
-BREAKEVEN_AT         = 0.50         # fraction of T
-LOCK_AT              = 0.90
-LOCK_FRACTION        = 0.70         # lock 70% of T
-RUNNER_GIVEBACK      = 0.10         # peak × 0.90
-RUNNER_GIVEBACK_LATE = 0.05         # peak × 0.95 (past original target)
-
-# Caution trailing
-CAUTION_TRAIL_SWINGS = 3            # completed 5-min candles
-CAUTION_ATR_BUFFER   = 0.10         # × ATR
-
-# Theta time-stop
-THETA_MINUTES        = 15
-THETA_MIN_PROGRESS   = 0.25         # fraction of T
+# Entry execution — marketable LIMIT, not MARKET. Buffer ensures near-certain
+# fill (like a market order) while capping worst-case slippage. All entries
+# are BUY (long option premium), so the buffer is always added above LTP.
+ENTRY_LIMIT_BUFFER_PCT      = 0.01   # 1% above fetched LTP — tune if fills are missed or slippage is worse than expected
+ENTRY_FILL_RETRY_ATTEMPTS   = 3
+ENTRY_FILL_RETRY_DELAY_SECS = 2
 
 # Paper fill model
 PAPER_SPREAD         = 0.75         # ₹ bid-ask; half-spread applied per side

@@ -109,28 +109,23 @@ class KiteLiveGateway(OrderGateway):
 
     def reconcile(self, position_state: dict) -> dict:
         """
-        Query Kite for live order statuses; mark sl_filled / target_filled if
-        the respective orders have been filled outside our executor's knowledge.
+        Query Kite for live order statuses; mark sl_filled if the SL order
+        has been filled outside our executor's knowledge.
         """
-        for key, fill_key, price_key in [
-            ("sl_order_id",     "sl_filled",     "sl_fill_price"),
-            ("target_order_id", "target_filled", "target_fill_price"),
-        ]:
-            oid = position_state.get(key)
-            if not oid:
-                continue
+        oid = position_state.get("sl_order_id")
+        if oid:
             result = self.get_order_status(oid)
-            if result.status == "COMPLETE" and not position_state.get(fill_key):
-                position_state[fill_key] = True
-                position_state[price_key] = result.filled_price
-                log.warning("LIVE reconcile: %s (%s) already filled @ %s",
-                            key, oid, result.filled_price)
+            if result.status == "COMPLETE" and not position_state.get("sl_filled"):
+                position_state["sl_filled"] = True
+                position_state["sl_fill_price"] = result.filled_price
+                log.warning("LIVE reconcile: sl_order_id (%s) already filled @ %s",
+                            oid, result.filled_price)
 
         # Also check if the net position is flat (safety catch-all)
         positions = self.get_open_positions()
         ts = position_state.get("tradingsymbol", "")
         net_qty = sum(p["quantity"] for p in positions if p["tradingsymbol"] == ts)
-        if net_qty == 0 and position_state.get("phase") in ("OPEN_FIXED", "LOCKED", "RUNNER"):
+        if net_qty == 0 and position_state.get("phase") == "OPEN":
             position_state["position_flat_external"] = True
             log.error("LIVE reconcile: position is flat externally for %s", ts)
 
