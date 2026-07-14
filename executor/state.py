@@ -65,6 +65,9 @@ _KEY_DAILY_PNL_PREFIX   = "executor:daily_pnl:"      # + date_str (YYYY-MM-DD)
 _KEY_NO_MORE_PREFIX     = "executor:entries_blocked:" # + date_str
 _DAILY_KEY_TTL_SECS     = 86400
 
+_KEY_CLOSED_TODAY_PREFIX = "executor:closed_today:"    # + date_str (YYYY-MM-DD), Redis list
+_KEY_DISCORD_MSG_ID_PREFIX = "executor:discord_msg_id:" # + date_str (YYYY-MM-DD)
+
 _KEY_PAPER_MODE_OVERRIDE = "executor:paper_mode_override"
 
 
@@ -293,6 +296,44 @@ def block_entries(r: redis_lib.Redis, date_str: str, reason: str) -> None:
 def block_reason(r: redis_lib.Redis, date_str: str) -> Optional[str]:
     raw = r.get(_no_more_key(date_str))
     return raw.decode() if isinstance(raw, bytes) else raw
+
+
+# ── Closed-today list + Discord consolidated tracker message-ID ────────────────
+
+def _closed_today_key(date_str: str) -> str:
+    return f"{_KEY_CLOSED_TODAY_PREFIX}{date_str}"
+
+
+def append_closed_today(r: redis_lib.Redis, date_str: str, record: dict) -> None:
+    """Append one closed-trade record to today's list. TTL refreshed on every
+    write so the list survives until end of day regardless of write order."""
+    key = _closed_today_key(date_str)
+    r.rpush(key, json.dumps(record))
+    r.expire(key, _DAILY_KEY_TTL_SECS)
+
+
+def get_closed_today(r: redis_lib.Redis, date_str: str) -> list[dict]:
+    raw_list = r.lrange(_closed_today_key(date_str), 0, -1)
+    out: list[dict] = []
+    for raw in raw_list or []:
+        try:
+            out.append(_loads_tolerant(raw))
+        except Exception:
+            continue
+    return out
+
+
+def _discord_msg_id_key(date_str: str) -> str:
+    return f"{_KEY_DISCORD_MSG_ID_PREFIX}{date_str}"
+
+
+def get_discord_msg_id(r: redis_lib.Redis, date_str: str) -> Optional[str]:
+    raw = r.get(_discord_msg_id_key(date_str))
+    return raw.decode() if isinstance(raw, bytes) else raw
+
+
+def set_discord_msg_id(r: redis_lib.Redis, date_str: str, msg_id: str) -> None:
+    r.set(_discord_msg_id_key(date_str), msg_id, ex=_DAILY_KEY_TTL_SECS)
 
 
 # ── PAPER_MODE runtime override ─────────────────────────────────────────────────

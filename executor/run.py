@@ -145,6 +145,12 @@ def main() -> None:
             # mirrors Repo 1 main.py's per-instrument exception isolation.
             log.error("instrument %s tick failed: %s", instrument, exc)
 
+    # ── 4. Update consolidated Discord tracker — once per tick, always ─────────
+    try:
+        journal.update_consolidated_tracker(r)
+    except Exception as exc:
+        log.error("consolidated tracker update failed: %s", exc)
+
     log.info("=== executor tick end ===")
 
 
@@ -275,7 +281,6 @@ def _run_idle(
         gateway.set_current_ltp(entry_ltp)
 
     manager.try_enter(intent, gateway, r, kite, entry_ltp, exchange)
-    journal.notify_entry(state_module.load_position(r, instrument) or {})
 
     # Bounded same-tick retry on the fill check — the marketable-LIMIT entry
     # may not register as filled at the instant try_enter places it; without
@@ -290,20 +295,20 @@ def _run_idle(
                 break
             if attempt < config.ENTRY_FILL_RETRY_ATTEMPTS - 1:
                 time.sleep(config.ENTRY_FILL_RETRY_DELAY_SECS)
-        if pos and pos.get("phase") == "OPEN":
-            journal.notify_entry(pos)
 
 
 def _journal_if_cooldown(r: redis_lib.Redis, instrument: str) -> None:
     """
-    Log trade to Notion + Discord once when we first enter COOLDOWN.
-    The notion_journaled flag prevents duplicate rows on subsequent runs
-    during the 15-minute cooldown window (executor runs every 1 minute).
+    Log trade to Notion once when we first enter COOLDOWN, and append it to
+    today's closed-trade list for the consolidated Discord tracker.
+    The notion_journaled flag prevents duplicate rows/entries on subsequent
+    runs during the 15-minute cooldown window (executor runs every 1 minute).
     """
     pos = state_module.load_position(r, instrument)
     if pos and pos.get("phase") == "COOLDOWN" and not pos.get("notion_journaled"):
         journal.log_trade_to_notion(pos)
-        journal.notify_exit(pos)
+        date_str = datetime.now(IST).date().isoformat()
+        state_module.append_closed_today(r, date_str, pos)
         pos["notion_journaled"] = True
         state_module.save_position(r, instrument, pos)
 

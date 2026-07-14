@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from executor import state as state_module
+
 log = logging.getLogger(__name__)
 
 _DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -24,6 +26,10 @@ _NOTION_DB_ID    = os.getenv("NOTION_TRADE_DB_ID", "")
 _NOTION_API      = "https://api.notion.com/v1"
 _NOTION_VERSION  = "2022-06-28"
 _IST             = ZoneInfo("Asia/Kolkata")
+
+OPEN_COLOR   = 0x4FC3F7
+CLOSED_COLOR = 0x00C853
+LOSS_COLOR   = 0xF44336
 
 # ── Exit reason mapping ────────────────────────────────────────────────────────
 # Maps internal exit_reason codes → Notion select option names (must match DB exactly)
@@ -97,38 +103,143 @@ def _discord(msg: str) -> None:
         log.warning("journal: Discord post failed: %s", exc)
 
 
-def notify_entry(pos: dict) -> None:
-    mode = "PAPER" if os.getenv("PAPER_MODE", "true").lower() != "false" else "LIVE"
-    msg = (
-        f"**[EXECUTOR] ENTRY** `{pos.get('tradingsymbol')}` "
-        f"dir={pos.get('direction')} "
-        f"entry=₹{pos.get('entry_premium', 0):.2f} "
-        f"sl=₹{pos.get('sl_premium', 0):.2f} "
-        f"qty={pos.get('qty')} "
-        f"({mode})"
-    )
-    _discord(msg)
-
-
-def notify_exit(pos: dict) -> None:
-    pnl = pos.get("pnl")
-    pnl_str = f"₹{pnl:+.2f}" if pnl is not None else "n/a"
-    emoji = "✅" if (pnl or 0) >= 0 else "❌"
-    msg = (
-        f"**[EXECUTOR] EXIT {emoji}** `{pos.get('tradingsymbol')}` "
-        f"reason={pos.get('exit_reason')} "
-        f"exit=₹{pos.get('exit_premium', 0):.2f} "
-        f"P&L={pnl_str}"
-    )
-    _discord(msg)
-
-
 def notify_gate_fail(reason: str, intent: dict) -> None:
     msg = (
         f"**[EXECUTOR] GATE FAIL** `{intent.get('tradingsymbol')}` "
         f"reason: {reason}"
     )
     _discord(msg)
+
+
+# ── Consolidated tracker (edit-in-place, one message per day) ──────────────────
+
+def _post_new(embed: dict) -> str | None:
+    if not _DISCORD_WEBHOOK:
+        return None
+    try:
+        resp = requests.post(
+            _DISCORD_WEBHOOK + "?wait=true",
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code in (200, 204):
+            return str(resp.json().get("id", ""))
+        log.warning("journal: consolidated POST returned %d: %s",
+                    resp.status_code, resp.text[:200])
+        return None
+    except Exception as exc:
+        log.warning("journal: consolidated POST failed: %s", exc)
+        return None
+
+
+def _edit_existing(msg_id: str, embed: dict) -> bool:
+    if not _DISCORD_WEBHOOK:
+        return False
+    try:
+        resp = requests.patch(
+            f"{_DISCORD_WEBHOOK}/messages/{msg_id}",
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        ok = resp.status_code in (200, 204)
+        if not ok:
+            log.warning("journal: consolidated PATCH returned %d: %s",
+                        resp.status_code, resp.text[:200])
+        return ok
+    except Exception as exc:
+        log.warning("journal: consolidated PATCH failed: %s", exc)
+        return False
+
+
+def _build_consolidated_embed(
+    open_positions: list[dict],
+    closed_positions: list[dict],
+    date_str: str,
+    mode_str: str,
+) -> dict:
+    fields = []
+
+    for pos in open_positions:
+        arrow = "↑" if pos.get("direction") == "CE" else "↓"
+        ltp   = pos.get("entry_premium", 0)  # updated via reconcile each tick
+        entry = pos.get("entry_premium", 0)
+        sl    = pos.get("sl_premium", 0)
+        qty   = pos.get("qty", 0)
+        direction = pos.get("direction", "?")
+        # Options always bought long — premium rising is always profit.
+        # Do not branch on direction (Repo 1's PE sign-inversion bug).
+        unreal = (ltp - entry) * qty
+        sign = "+" if unreal >= 0 else ""
+        fields.append({
+            "name": f"{pos.get('tradingsymbol', pos.get('instrument'))} {direction} {arrow} [OPEN]",
+            "value": (
+                f"Entry ₹{entry:.2f} · SL ₹{sl:.2f}\n"
+                f"Unrealized ≈ {sign}₹{unreal:.0f} (gross, est.)"
+            ),
+            "inline": False,
+        })
+
+    for rec in closed_positions:
+        arrow = "↑" if rec.get("direction") == "CE" else "↓"
+        pnl   = rec.get("pnl", 0) or 0
+        sign  = "+" if pnl >= 0 else ""
+        fields.append({
+            "name": f"{rec.get('tradingsymbol', rec.get('instrument'))} {rec.get('direction')} {arrow} [CLOSED]",
+            "value": (
+                f"Entry ₹{rec.get('entry_premium', 0):.2f} · "
+                f"Exit ₹{rec.get('exit_premium', 0):.2f} · "
+                f"Net {sign}₹{pnl:.2f} · {rec.get('exit_reason', '')}"
+            ),
+            "inline": False,
+        })
+
+    if not fields:
+        fields.append({
+            "name": "No activity",
+            "value": "No open or closed positions yet today.",
+            "inline": False,
+        })
+
+    return {
+        "title":     f"📊 Executor — {mode_str} — {date_str}",
+        "color":     OPEN_COLOR,
+        "fields":    fields,
+        "footer":    {"text": f"{mode_str} mode · updated each cycle"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def update_consolidated_tracker(r) -> bool:
+    """Rebuild and PATCH (or POST, on first call of the day) the single
+    consolidated Discord message covering all 17 instruments. Mirrors Repo
+    1's send_paper_consolidated. Called unconditionally once per tick,
+    regardless of whether anything changed this cycle."""
+    if not _DISCORD_WEBHOOK:
+        return False
+
+    date_str = datetime.now(_IST).date().isoformat()
+    mode_str = "PAPER" if os.getenv("PAPER_MODE", "true").lower() != "false" else "LIVE"
+
+    open_positions = []
+    for inst in state_module.list_open_instruments(r):
+        pos = state_module.load_position(r, inst)
+        if pos:
+            open_positions.append(pos)
+
+    closed_positions = state_module.get_closed_today(r, date_str)
+
+    embed = _build_consolidated_embed(open_positions, closed_positions, date_str, mode_str)
+
+    existing_id = state_module.get_discord_msg_id(r, date_str)
+    if existing_id:
+        return _edit_existing(existing_id, embed)
+
+    msg_id = _post_new(embed)
+    if msg_id:
+        state_module.set_discord_msg_id(r, date_str, msg_id)
+        log.info("journal: consolidated tracker message created (id=%s)", msg_id)
+        return True
+    return False
 
 
 # ── Notion ─────────────────────────────────────────────────────────────────────
