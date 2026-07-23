@@ -81,16 +81,26 @@ def _build_kite(r: redis_lib.Redis) -> KiteClient:
     return KiteClient(api_key=api_key, access_token=access_token)
 
 
-def _get_rsi_snapshot(kite: KiteClient, r: redis_lib.Redis, instrument: str) -> list[float] | None:
+def _get_rsi_snapshot(
+    kite: KiteClient, r: redis_lib.Redis, instrument: str, pos: dict | None = None,
+) -> list[float] | None:
     """Port of Repo 1's position_tracker._get_rsi_snapshot: fetch OHLCV via
     the instrument's underlying token, compute RSI, take the last 3 values.
 
     Used only by the ladder's compute_ai_adjusted_sl — a fetch failure here
     just means the AI-adjusted tightening is skipped this tick (the ladder
     SL itself does not depend on RSI).
+
+    For dynamic stock positions, `auth.get_underlying_token()` only checks
+    the static caches and will raise — prefer the position's own snapshotted
+    `equity_token` (set at entry, see state.fresh_position_from_intent)
+    instead.
     """
     try:
-        token = auth.get_underlying_token(r, instrument)
+        if pos and pos.get("is_dynamic") and pos.get("equity_token"):
+            token = pos["equity_token"]
+        else:
+            token = auth.get_underlying_token(r, instrument)
         now = datetime.now(IST)
         from_dt = now - timedelta(days=5)   # warm-up for RSI(14) across weekends/holidays
         df = kite.get_historical_candles(token, from_dt, now, interval="5minute")
@@ -154,23 +164,32 @@ def main() -> None:
     squareoff_time = ist_hhmm(config.SQUAREOFF_IST, now)
     past_squareoff = now >= squareoff_time
 
-    # ── 3. Loop all 17 instruments — single pass: gates/entry/exit + first
-    # OPEN-position management pass, as today. Do NOT put this inside the
-    # sub-loop. ──────────────────────────────────────────────────────────────
-    for inst_cfg in config.INDICES + config.STOCKS:
+    # ── 2c. Dynamic stock universe (Repo 1's daily top-gainer/top-loser
+    # picks) — read fresh every tick, NEVER cached daily (unlike the lot
+    # multiplier). Fail-open: state.get_dynamic_instruments() never raises;
+    # a bad/missing/stale payload just means zero dynamic picks this tick. ──
+    today_str = now.date().isoformat()
+    dynamic_instruments = state_module.get_dynamic_instruments(r, today_str)
+    if dynamic_instruments:
+        log.info("dynamic instruments today: %s", [d["name"] for d in dynamic_instruments])
+
+    # ── 3. Loop all instruments (static 17 + today's dynamic picks) —
+    # single pass: gates/entry/exit + first OPEN-position management pass,
+    # as today. Do NOT put this inside the sub-loop. ─────────────────────────
+    for inst_cfg in config.INDICES + config.STOCKS + dynamic_instruments:
         instrument = inst_cfg["name"]
         exchange   = inst_cfg.get("fno_exchange", "NFO")
         try:
             _run_one_instrument(r, kite, gateway, instrument, exchange, past_squareoff, lot_multiplier)
         except Exception as exc:
-            # One instrument's failure must never block the other 16 —
+            # One instrument's failure must never block the others —
             # mirrors Repo 1 main.py's per-instrument exception isolation.
             log.error("instrument %s tick failed: %s", instrument, exc)
 
     # ── 3b. Intra-minute trailing-SL sub-loop — OPEN-position management only.
     # Does NOT re-run gates.check_all(), manager.try_enter(), or the
     # kill-switch check; only manage_position()/exit-check repeats. ──────────
-    _run_trailing_subloop(r, kite, gateway, past_squareoff, squareoff_time)
+    _run_trailing_subloop(r, kite, gateway, past_squareoff, squareoff_time, dynamic_instruments)
 
     # ── 4. Update consolidated Discord tracker — once per tick, always ─────────
     try:
@@ -187,6 +206,7 @@ def _run_trailing_subloop(
     gateway,
     past_squareoff: bool,
     squareoff_time: datetime,
+    dynamic_instruments: list[dict] | None = None,
 ) -> None:
     """Up to TRACKER_SUBLOOPS - 1 additional OPEN-position management passes,
     spaced TRACKER_SUBLOOP_SECS apart, budget-anchored to EXEC_JOB_START_EPOCH
@@ -198,7 +218,7 @@ def _run_trailing_subloop(
     job_start_epoch = float(os.environ.get("EXEC_JOB_START_EPOCH", time.time()))
 
     open_instruments: list[tuple[str, str]] = []
-    for inst_cfg in config.INDICES + config.STOCKS:
+    for inst_cfg in config.INDICES + config.STOCKS + list(dynamic_instruments or []):
         instrument = inst_cfg["name"]
         pos = state_module.load_position(r, instrument)
         if pos and pos.get("phase") == "OPEN":
@@ -265,7 +285,7 @@ def _manage_open_positions_pass(
                 still_open.append((instrument, exchange))
                 continue
 
-            rsi_last3 = _get_rsi_snapshot(kite, r, instrument)
+            rsi_last3 = _get_rsi_snapshot(kite, r, instrument, pos)
             manager.manage_position(gateway, pos, r, option_ltp, rsi_last3)
 
             pos = state_module.load_position(r, instrument)
@@ -348,7 +368,7 @@ def _run_one_instrument(
         if option_ltp <= 0:
             log.error("%s: option LTP unavailable — skipping management tick", instrument)
             return
-        rsi_last3 = _get_rsi_snapshot(kite, r, instrument)
+        rsi_last3 = _get_rsi_snapshot(kite, r, instrument, pos)
         manager.manage_position(gateway, pos, r, option_ltp, rsi_last3)
         # Check if manage_position transitioned to EXITING this tick
         pos = state_module.load_position(r, instrument)

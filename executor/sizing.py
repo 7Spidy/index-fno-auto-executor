@@ -42,6 +42,7 @@ def compute_qty(
     paper_mode: bool,
     kite: "KiteClient | None" = None,
     lot_multiplier: int = 1,
+    lot_size_override: int | None = None,
 ) -> int:
     """
     Fixed-lot sizing, mirroring Repo 1's paper_engine.py exactly.
@@ -58,9 +59,14 @@ def compute_qty(
     once-per-day multiplier decided in run.py's main() (see
     state.get_lot_multiplier / set_lot_multiplier_if_absent).
 
+    `lot_size_override` — for dynamic stock instruments, whose tradingsymbol
+    doesn't exist in the shared static Redis lot-size cache. When provided,
+    bypasses get_lot_size() entirely and uses this value instead (the lot
+    size Repo 1 already resolved and attached to the intent).
+
     Returns 0 (skip entry) if entry_cost > remaining capital.
     """
-    lot_size = get_lot_size(r, tradingsymbol)
+    lot_size = lot_size_override if lot_size_override is not None else get_lot_size(r, tradingsymbol)
     qty = lot_size * lot_multiplier
 
     if paper_mode:

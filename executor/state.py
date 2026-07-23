@@ -21,6 +21,10 @@ Position dict schema (all phases share the same key; unused fields are None):
   atm_strike         int
   spot_risk_pts      float
   atm_delta          float
+  is_dynamic         bool   True for dynamic top-gainer/top-loser stock picks
+  equity_token       int | None  (dynamic only) snapshotted underlying token for RSI
+  fno_exchange       str | None  (dynamic only) snapshotted F&O exchange
+  direction_restriction str | None  (dynamic only) "CE_ONLY" | "PE_ONLY"
   entry_premium      float  (set on fill)
   entry_spot         float  underlying spot at entry fill time
   entry_limit_price  float  marketable-LIMIT price the entry order was placed at
@@ -74,6 +78,9 @@ _KEY_LOT_MULTIPLIER_PREFIX = "executor:lot_multiplier:"   # + date_str (YYYY-MM-
 _LOT_MULTIPLIER_TTL_SECS   = 86400
 
 _KEY_KILL_SWITCH = "executor:kill_switch"
+
+_KEY_DYNAMIC_UNIVERSE = "stock:dynamic_universe"
+_DYNAMIC_REQUIRED_FIELDS = ("name", "lot_size", "equity_token", "fno_exchange", "direction_restriction")
 
 
 def _loads_tolerant(raw: Any) -> Any:
@@ -230,6 +237,16 @@ def fresh_position_from_intent(intent: dict) -> dict:
         "atm_strike":          intent["atm_strike"],
         "spot_risk_pts":       intent["spot_risk_pts"],
         "atm_delta":           intent.get("atm_delta", 0.50),
+        # dynamic-stock metadata snapshot — makes the position self-sufficient
+        # for its entire lifecycle (entry through exit/cooldown) regardless
+        # of what stock:dynamic_universe contains on later days (Repo 1
+        # overwrites that key at EOD for the next trading day). All
+        # exit/cooldown/force_squareoff paths in manager.py must read these
+        # snapshotted fields, never re-derive from stock:dynamic_universe.
+        "is_dynamic":          intent.get("is_dynamic", False),
+        "equity_token":        intent.get("equity_token") if intent.get("is_dynamic") else None,
+        "fno_exchange":        intent.get("fno_exchange") if intent.get("is_dynamic") else None,
+        "direction_restriction": intent.get("direction_restriction") if intent.get("is_dynamic") else None,
         # filled on entry
         "entry_premium":       None,
         "entry_spot":          None,
@@ -410,3 +427,67 @@ def get_kill_switch(r: redis_lib.Redis) -> bool:
 def set_kill_switch(r: redis_lib.Redis, value: bool) -> None:
     r.set(_KEY_KILL_SWITCH, "true" if value else "false")
     log.info("state: kill switch set to %s", "ON" if value else "OFF")
+
+
+# ── Dynamic stock universe (Repo 1's daily top-gainer/top-loser picks) ─────────
+
+def get_dynamic_instruments(r: redis_lib.Redis, today_date_str: str) -> list[dict]:
+    """
+    Reads Repo 1's stock:dynamic_universe payload. Returns a list of 0-2
+    instrument dicts (dynamic gainer/loser), normalized to look like a static
+    instrument-cfg dict for run.py's loop (at minimum: name, fno_exchange,
+    lot_size, equity_token, direction_restriction, is_dynamic=True).
+
+    Fail-open: any of the following degrades to [] (or drops just the
+    offending pick) — this must NEVER block the static instrument loop:
+      - key absent
+      - payload fails to parse
+      - payload's "date" field != today_date_str (stale — Repo 1 writes this
+        once at EOD for the *next* trading day)
+      - an individual pick is missing a required field (name, lot_size,
+        equity_token, fno_exchange, direction_restriction)
+    """
+    raw = r.get(_KEY_DYNAMIC_UNIVERSE)
+    if not raw:
+        return []
+
+    try:
+        payload = _loads_tolerant(raw)
+    except Exception as exc:
+        log.warning("state: dynamic universe payload failed to parse: %s — skipping", exc)
+        return []
+
+    if not isinstance(payload, dict):
+        log.warning("state: dynamic universe payload is not a dict — skipping")
+        return []
+
+    if payload.get("date") != today_date_str:
+        log.warning(
+            "state: dynamic universe payload stale (date=%s, expected=%s) — skipping",
+            payload.get("date"), today_date_str,
+        )
+        return []
+
+    picks = payload.get("picks")
+    if not isinstance(picks, list):
+        log.warning("state: dynamic universe payload has no valid 'picks' list — skipping")
+        return []
+
+    out: list[dict] = []
+    for pick in picks:
+        if not isinstance(pick, dict):
+            log.warning("state: dynamic universe pick is not a dict — dropping: %r", pick)
+            continue
+        missing = [f for f in _DYNAMIC_REQUIRED_FIELDS if not pick.get(f)]
+        if missing:
+            log.warning(
+                "state: dynamic universe pick missing required field(s) %s — dropping: %r",
+                missing, pick.get("name", "?"),
+            )
+            continue
+        normalized = dict(pick)
+        normalized["is_dynamic"] = True
+        normalized.setdefault("fno_exchange", "NFO")
+        out.append(normalized)
+
+    return out

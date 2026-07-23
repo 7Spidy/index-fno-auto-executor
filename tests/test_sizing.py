@@ -123,3 +123,37 @@ def test_decide_lot_multiplier_at_threshold_is_2x():
 def test_decide_lot_multiplier_above_threshold_is_2x():
     with patch("executor.config.LOT_MULTIPLIER_CAPITAL_THRESHOLD", 50_000):
         assert sizing.decide_lot_multiplier(60_000) == 2
+
+
+# ── lot_size_override (dynamic stock instruments) ───────────────────────────
+
+def test_compute_qty_lot_size_override_bypasses_get_lot_size(redis_mock):
+    with patch("executor.state.committed_premium", return_value=0.0), \
+         patch("executor.config.CAPITAL_RS", 1_00_000), \
+         patch("executor.sizing.get_lot_size") as mock_get_lot_size:
+        qty = sizing.compute_qty(
+            redis_mock, "TATASTEEL25710722750PE", entry_ltp=10.0, paper_mode=True,
+            lot_size_override=2750,
+        )
+    mock_get_lot_size.assert_not_called()
+    assert qty == 2750
+
+
+def test_compute_qty_lot_size_override_none_uses_get_lot_size(redis_mock):
+    with patch("executor.state.committed_premium", return_value=0.0), \
+         patch("executor.config.CAPITAL_RS", 1_00_000):
+        qty = sizing.compute_qty(
+            redis_mock, "NIFTYTEST", entry_ltp=100.0, paper_mode=True,
+            lot_size_override=None,
+        )
+    assert qty == LOT_SIZE   # falls back to the patched get_lot_size fixture
+
+
+def test_compute_qty_lot_size_override_respects_capital_gate(redis_mock):
+    with patch("executor.state.committed_premium", return_value=0.0), \
+         patch("executor.config.CAPITAL_RS", 1000):
+        qty = sizing.compute_qty(
+            redis_mock, "TATASTEEL25710722750PE", entry_ltp=50.0, paper_mode=True,
+            lot_size_override=2750,   # entry_cost = 50*2750 = 137500 > capital
+        )
+    assert qty == 0

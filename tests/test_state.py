@@ -122,3 +122,122 @@ def test_set_lot_multiplier_if_absent_second_concurrent_call_is_noop():
     r.set.return_value = None   # NX set found the key already present
     ok = state.set_lot_multiplier_if_absent(r, "2026-07-23", 2)
     assert ok is False
+
+
+# ── Dynamic stock universe ───────────────────────────────────────────────────
+
+import json
+
+
+def _pick(name="RELIANCE", **overrides):
+    base = {
+        "name": name,
+        "lot_size": 250,
+        "equity_token": 12345,
+        "fno_exchange": "NFO",
+        "direction_restriction": "CE_ONLY",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_get_dynamic_instruments_valid_payload_two_picks():
+    r = MagicMock()
+    payload = {
+        "date": "2026-07-23",
+        "picks": [_pick("RELIANCE", direction_restriction="CE_ONLY"),
+                  _pick("TATASTEEL", direction_restriction="PE_ONLY")],
+    }
+    r.get.return_value = json.dumps(payload).encode()
+    out = state.get_dynamic_instruments(r, "2026-07-23")
+    assert [d["name"] for d in out] == ["RELIANCE", "TATASTEEL"]
+    assert all(d["is_dynamic"] is True for d in out)
+
+
+def test_get_dynamic_instruments_valid_payload_one_pick():
+    r = MagicMock()
+    payload = {"date": "2026-07-23", "picks": [_pick("INFY")]}
+    r.get.return_value = json.dumps(payload).encode()
+    out = state.get_dynamic_instruments(r, "2026-07-23")
+    assert len(out) == 1
+    assert out[0]["name"] == "INFY"
+
+
+def test_get_dynamic_instruments_missing_key_returns_empty():
+    r = MagicMock()
+    r.get.return_value = None
+    assert state.get_dynamic_instruments(r, "2026-07-23") == []
+
+
+def test_get_dynamic_instruments_stale_date_returns_empty():
+    r = MagicMock()
+    payload = {"date": "2026-07-22", "picks": [_pick("INFY")]}
+    r.get.return_value = json.dumps(payload).encode()
+    assert state.get_dynamic_instruments(r, "2026-07-23") == []
+
+
+def test_get_dynamic_instruments_malformed_json_returns_empty():
+    r = MagicMock()
+    r.get.return_value = b"{not valid json"
+    assert state.get_dynamic_instruments(r, "2026-07-23") == []
+
+
+def test_get_dynamic_instruments_pick_missing_required_field_is_dropped():
+    r = MagicMock()
+    bad_pick = _pick("INFY")
+    del bad_pick["equity_token"]
+    payload = {"date": "2026-07-23", "picks": [bad_pick, _pick("RELIANCE")]}
+    r.get.return_value = json.dumps(payload).encode()
+    out = state.get_dynamic_instruments(r, "2026-07-23")
+    assert [d["name"] for d in out] == ["RELIANCE"]
+
+
+def test_get_dynamic_instruments_non_dict_payload_returns_empty():
+    r = MagicMock()
+    r.get.return_value = json.dumps([1, 2, 3]).encode()
+    assert state.get_dynamic_instruments(r, "2026-07-23") == []
+
+
+def test_get_dynamic_instruments_picks_not_a_list_returns_empty():
+    r = MagicMock()
+    payload = {"date": "2026-07-23", "picks": "not-a-list"}
+    r.get.return_value = json.dumps(payload).encode()
+    assert state.get_dynamic_instruments(r, "2026-07-23") == []
+
+
+# ── fresh_position_from_intent dynamic snapshot ─────────────────────────────
+
+def _base_intent(**overrides):
+    intent = {
+        "ts": "2026-07-23T05:00:00+00:00",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "tradingsymbol": "NIFTY25710724500CE",
+        "atm_strike": 24500,
+        "spot_risk_pts": 40.0,
+    }
+    intent.update(overrides)
+    return intent
+
+
+def test_fresh_position_from_intent_static_has_no_dynamic_fields():
+    pos = state.fresh_position_from_intent(_base_intent())
+    assert pos["is_dynamic"] is False
+    assert pos["equity_token"] is None
+    assert pos["fno_exchange"] is None
+    assert pos["direction_restriction"] is None
+
+
+def test_fresh_position_from_intent_dynamic_snapshots_metadata():
+    intent = _base_intent(
+        instrument="TATASTEEL",
+        is_dynamic=True,
+        equity_token=999,
+        fno_exchange="NFO",
+        direction_restriction="PE_ONLY",
+    )
+    pos = state.fresh_position_from_intent(intent)
+    assert pos["is_dynamic"] is True
+    assert pos["equity_token"] == 999
+    assert pos["fno_exchange"] == "NFO"
+    assert pos["direction_restriction"] == "PE_ONLY"

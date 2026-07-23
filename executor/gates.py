@@ -50,6 +50,18 @@ def check_all(
         reason = block_reason(r, date_str) or "entries blocked"
         return False, reason
 
+    # 0c. Dynamic direction-restriction safety net (defense in depth). Repo 2
+    # doesn't recompute signals — it should not blindly trust a single
+    # upstream field without a cross-check. Should never actually fire in
+    # practice (Repo 1 only ever generates the matching direction for a
+    # dynamic pick).
+    if intent.get("is_dynamic"):
+        restriction = intent.get("direction_restriction")
+        direction   = intent.get("direction")
+        if (restriction == "CE_ONLY" and direction != "CE") or \
+           (restriction == "PE_ONLY" and direction != "PE"):
+            return False, "dynamic direction_restriction violated"
+
     # 1. Cooldown — no new entry within COOLDOWN_CANDLES × 5 min of last signal
     #    for THIS instrument (mirrors Repo 1's per-instrument cooldown:{name}:{direction}
     #    key in main.py/stock_main.py — cooldown is not global across instruments).
@@ -141,14 +153,19 @@ def _check_option_tradable(
     if not ts:
         return False, "tradingsymbol missing from intent"
 
-    # Check instrument exists in the shared token cache
-    try:
-        token_cache = auth.get_option_cache(r)
-    except RuntimeError as exc:
-        return False, str(exc)
+    # Static-cache membership check is skipped for dynamic intents — a
+    # dynamic stock's tradingsymbol legitimately never appears in the shared
+    # static cache (kite:stock_option_tokens is only ever populated for the
+    # static 14 stocks). The live LTP check below remains mandatory and
+    # unchanged for both static and dynamic instruments.
+    if not intent.get("is_dynamic"):
+        try:
+            token_cache = auth.get_option_cache(r)
+        except RuntimeError as exc:
+            return False, str(exc)
 
-    if ts not in token_cache:
-        return False, f"{ts} not found in option token cache"
+        if ts not in token_cache:
+            return False, f"{ts} not found in option token cache"
 
     # Check LTP is non-zero
     try:

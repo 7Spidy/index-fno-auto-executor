@@ -64,6 +64,7 @@ def try_enter(
         paper_mode=config.PAPER_MODE,
         kite=kite if not config.PAPER_MODE else None,
         lot_multiplier=lot_multiplier,
+        lot_size_override=intent.get("lot_size") if intent.get("is_dynamic") else None,
     )
     if qty == 0:
         log.warning("manager: sizing returned 0 — aborting entry")
