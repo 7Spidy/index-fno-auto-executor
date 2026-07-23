@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 
 import redis as redis_lib
 
-from executor import config, gates, manager, journal
+from executor import config, gates, manager, journal, sizing
 from executor import state as state_module
 from executor.gateway.paper import PaperGateway
 from executor.gateway.kite_live import KiteLiveGateway
@@ -130,20 +130,47 @@ def main() -> None:
     else:
         gateway = KiteLiveGateway(kite)
 
+    # ── 2b. Lot multiplier — decided once per day, live mode only. Never
+    # re-evaluated per-instrument or per-trade. Paper mode always 1x. ─────────
+    if not _PAPER_MODE:
+        date_str = now_ist().date().isoformat()
+        lot_multiplier = state_module.get_lot_multiplier(r, date_str)
+        if lot_multiplier is None:
+            try:
+                capital = kite.get_margins(r)
+            except Exception as exc:
+                log.error("morning capital check failed: %s — no trading until resolved", exc)
+                return  # do not proceed with the tick; retry next minute
+            lot_multiplier = sizing.decide_lot_multiplier(capital)
+            set_ok = state_module.set_lot_multiplier_if_absent(r, date_str, lot_multiplier)
+            if not set_ok:
+                lot_multiplier = state_module.get_lot_multiplier(r, date_str)
+            log.info("lot multiplier for %s decided: capital=₹%.0f -> x%d",
+                      date_str, capital, lot_multiplier)
+    else:
+        lot_multiplier = 1
+
     now = now_ist()
     squareoff_time = ist_hhmm(config.SQUAREOFF_IST, now)
     past_squareoff = now >= squareoff_time
 
-    # ── 3. Loop all 17 instruments ──────────────────────────────────────────────
+    # ── 3. Loop all 17 instruments — single pass: gates/entry/exit + first
+    # OPEN-position management pass, as today. Do NOT put this inside the
+    # sub-loop. ──────────────────────────────────────────────────────────────
     for inst_cfg in config.INDICES + config.STOCKS:
         instrument = inst_cfg["name"]
         exchange   = inst_cfg.get("fno_exchange", "NFO")
         try:
-            _run_one_instrument(r, kite, gateway, instrument, exchange, past_squareoff)
+            _run_one_instrument(r, kite, gateway, instrument, exchange, past_squareoff, lot_multiplier)
         except Exception as exc:
             # One instrument's failure must never block the other 16 —
             # mirrors Repo 1 main.py's per-instrument exception isolation.
             log.error("instrument %s tick failed: %s", instrument, exc)
+
+    # ── 3b. Intra-minute trailing-SL sub-loop — OPEN-position management only.
+    # Does NOT re-run gates.check_all(), manager.try_enter(), or the
+    # kill-switch check; only manage_position()/exit-check repeats. ──────────
+    _run_trailing_subloop(r, kite, gateway, past_squareoff, squareoff_time)
 
     # ── 4. Update consolidated Discord tracker — once per tick, always ─────────
     try:
@@ -154,6 +181,109 @@ def main() -> None:
     log.info("=== executor tick end ===")
 
 
+def _run_trailing_subloop(
+    r: redis_lib.Redis,
+    kite: KiteClient,
+    gateway,
+    past_squareoff: bool,
+    squareoff_time: datetime,
+) -> None:
+    """Up to TRACKER_SUBLOOPS - 1 additional OPEN-position management passes,
+    spaced TRACKER_SUBLOOP_SECS apart, budget-anchored to EXEC_JOB_START_EPOCH
+    (exported by the workflow as its first step). EXEC_SUBLOOPS=1 reverts to
+    today's single-pass behaviour (loop below never executes)."""
+    if config.TRACKER_SUBLOOPS <= 1 or past_squareoff:
+        return
+
+    job_start_epoch = float(os.environ.get("EXEC_JOB_START_EPOCH", time.time()))
+
+    open_instruments: list[tuple[str, str]] = []
+    for inst_cfg in config.INDICES + config.STOCKS:
+        instrument = inst_cfg["name"]
+        pos = state_module.load_position(r, instrument)
+        if pos and pos.get("phase") == "OPEN":
+            open_instruments.append((instrument, inst_cfg.get("fno_exchange", "NFO")))
+
+    for pass_num in range(1, config.TRACKER_SUBLOOPS):
+        if not open_instruments:
+            log.info("subloop: no OPEN instruments remain — stopping early (pass %d)", pass_num)
+            return
+        if now_ist() >= squareoff_time:
+            log.info("subloop: past squareoff — stopping early (pass %d)", pass_num)
+            return
+        elapsed = time.time() - job_start_epoch
+        remaining = config.TRACKER_JOB_BUDGET_SECS - elapsed
+        if remaining < config.TRACKER_SUBLOOP_SECS:
+            log.info("subloop: budget exhausted (remaining=%.1fs) — stopping early (pass %d)",
+                      remaining, pass_num)
+            return
+
+        time.sleep(config.TRACKER_SUBLOOP_SECS)
+
+        log.info("subloop: pass %d/%d — managing %d OPEN instrument(s)",
+                  pass_num + 1, config.TRACKER_SUBLOOPS, len(open_instruments))
+        open_instruments = _manage_open_positions_pass(r, kite, gateway, open_instruments)
+
+
+def _manage_open_positions_pass(
+    r: redis_lib.Redis,
+    kite: KiteClient,
+    gateway,
+    open_instruments: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """One sub-loop pass: trailing SL / exit-trigger check only for
+    currently-OPEN instruments. No entry gates, no try_enter. Per-instrument
+    exception isolation, same as the main tick. Returns the instruments still
+    OPEN after this pass."""
+    still_open: list[tuple[str, str]] = []
+    for instrument, exchange in open_instruments:
+        try:
+            pos = state_module.load_position(r, instrument)
+            if not pos or pos.get("phase") != "OPEN":
+                continue
+            tradingsymbol = pos["tradingsymbol"]
+
+            try:
+                opt_map = kite.get_ltp([f"{exchange}:{tradingsymbol}"])
+                option_ltp = opt_map.get(f"{exchange}:{tradingsymbol}", 0.0)
+            except Exception as exc:
+                log.error("%s: subloop option LTP fetch failed: %s", instrument, exc)
+                still_open.append((instrument, exchange))
+                continue
+
+            if isinstance(gateway, PaperGateway) and option_ltp > 0:
+                gateway.set_current_ltp(option_ltp)
+                gateway.process_tick(tradingsymbol)
+
+            pos = state_module.load_position(r, instrument)
+            if pos and pos.get("phase") == "OPEN":
+                pos = gateway.reconcile(pos)
+                state_module.save_position(r, instrument, pos)
+
+            if option_ltp <= 0:
+                log.error("%s: subloop option LTP unavailable — skipping this pass", instrument)
+                still_open.append((instrument, exchange))
+                continue
+
+            rsi_last3 = _get_rsi_snapshot(kite, r, instrument)
+            manager.manage_position(gateway, pos, r, option_ltp, rsi_last3)
+
+            pos = state_module.load_position(r, instrument)
+            if pos and pos.get("phase") == "EXITING":
+                manager.check_exit_complete(gateway, pos, r, kite)
+                _journal_if_cooldown(r, instrument)
+                continue
+
+            if pos and pos.get("phase") == "OPEN":
+                still_open.append((instrument, exchange))
+        except Exception as exc:
+            # One instrument's failure must never block the others' trailing
+            # SL updates.
+            log.error("subloop: instrument %s failed: %s", instrument, exc)
+            still_open.append((instrument, exchange))
+    return still_open
+
+
 def _run_one_instrument(
     r: redis_lib.Redis,
     kite: KiteClient,
@@ -161,6 +291,7 @@ def _run_one_instrument(
     instrument: str,
     exchange: str,
     past_squareoff: bool,
+    lot_multiplier: int = 1,
 ) -> None:
     pos = state_module.load_position(r, instrument)
     tradingsymbol = pos["tradingsymbol"] if pos else None
@@ -208,7 +339,7 @@ def _run_one_instrument(
 
     # ── Phase routing ───────────────────────────────────────────────────────
     if pos is None or pos.get("phase") in (None, "IDLE"):
-        _run_idle(r, kite, gateway, instrument, exchange, option_ltp, spot_ltp)
+        _run_idle(r, kite, gateway, instrument, exchange, option_ltp, spot_ltp, lot_multiplier)
 
     elif pos["phase"] == "ENTERING":
         manager.check_entry_fill(gateway, pos, r, spot_ltp, option_ltp)
@@ -241,6 +372,7 @@ def _run_idle(
     exchange: str,
     option_ltp: float,
     spot_ltp: float,
+    lot_multiplier: int = 1,
 ) -> None:
     """Check for pending intent; run entry gate; enter if passes."""
     intent = state_module.load_intent(r, instrument)
@@ -280,7 +412,7 @@ def _run_idle(
     if isinstance(gateway, PaperGateway):
         gateway.set_current_ltp(entry_ltp)
 
-    manager.try_enter(intent, gateway, r, kite, entry_ltp, exchange)
+    manager.try_enter(intent, gateway, r, kite, entry_ltp, exchange, lot_multiplier=lot_multiplier)
 
     # Bounded same-tick retry on the fill check — the marketable-LIMIT entry
     # may not register as filled at the instant try_enter places it; without

@@ -41,20 +41,27 @@ def compute_qty(
     entry_ltp: float,
     paper_mode: bool,
     kite: "KiteClient | None" = None,
+    lot_multiplier: int = 1,
 ) -> int:
     """
     Fixed-lot sizing, mirroring Repo 1's paper_engine.py exactly.
-    Always 1 lot (lot_size from shared instrument cache — auto-syncs with
-    Repo 1's INDEX_LOT_SIZES / stock_config lot tables since both write to
-    the same Redis instrument cache).
+    Base size is 1 lot (lot_size from shared instrument cache — auto-syncs
+    with Repo 1's INDEX_LOT_SIZES / stock_config lot tables since both write
+    to the same Redis instrument cache); final qty = lot_size * lot_multiplier.
 
     Capital-availability gate:
       - paper_mode=True  -> use fixed CAPITAL_RS (== Repo 1's DAILY_CAPITAL)
       - paper_mode=False -> use live available capital from kite.get_margins()
 
+    `lot_multiplier` — always 1 in paper mode (callers must pass it
+    explicitly, do not rely on the default silently). In live mode it is the
+    once-per-day multiplier decided in run.py's main() (see
+    state.get_lot_multiplier / set_lot_multiplier_if_absent).
+
     Returns 0 (skip entry) if entry_cost > remaining capital.
     """
     lot_size = get_lot_size(r, tradingsymbol)
+    qty = lot_size * lot_multiplier
 
     if paper_mode:
         capital = config.CAPITAL_RS
@@ -66,7 +73,7 @@ def compute_qty(
 
     committed = state.committed_premium(r)          # mirrors Repo 1 _committed_premium()
     remaining = capital - committed
-    entry_cost = entry_ltp * lot_size
+    entry_cost = entry_ltp * qty
 
     if entry_cost > remaining:
         log.warning(
@@ -75,9 +82,19 @@ def compute_qty(
         )
         return 0
 
-    log.info("sizing: lot_size=%d qty=%d entry_cost=₹%.0f remaining=₹%.0f",
-              lot_size, lot_size, entry_cost, remaining)
-    return lot_size
+    log.info("sizing: lot_size=%d multiplier=%d qty=%d entry_cost=₹%.0f remaining=₹%.0f",
+              lot_size, lot_multiplier, qty, entry_cost, remaining)
+    return qty
+
+
+def decide_lot_multiplier(capital: float) -> int:
+    """
+    Once-per-day lot-multiplier decision (live mode only — see run.py's
+    main()). capital < threshold -> 1, capital >= threshold -> 2.
+    """
+    if capital >= config.LOT_MULTIPLIER_CAPITAL_THRESHOLD:
+        return 2
+    return 1
 
 
 def get_daily_loss_limit(

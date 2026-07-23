@@ -1,6 +1,15 @@
 """
 Entry gate — spec §4.  All conditions must pass; if any fails the intent is
 discarded (not retried) and the gate returns (False, reason).
+
+Manual kill switch (executor:kill_switch, Redis string "true"/"false", no
+TTL) — checked first in check_all() as a cheap short-circuit before any Kite
+API calls. Set/clear manually via redis-cli or an ad-hoc script:
+  redis-cli -u $REDIS_URL SET executor:kill_switch true
+  redis-cli -u $REDIS_URL SET executor:kill_switch false
+Blocks NEW ENTRIES ONLY — positions already OPEN continue through their
+normal SL/target/trailing/exit lifecycle untouched; this does not force a
+squareoff. See state.get_kill_switch / state.set_kill_switch.
 """
 
 from __future__ import annotations
@@ -28,9 +37,14 @@ def check_all(
     Run all entry gate checks in spec order.
     Returns (True, "") on pass, or (False, reason_string) on first failure.
     """
-    from executor.state import entries_blocked, block_reason
+    from executor.state import entries_blocked, block_reason, get_kill_switch
 
-    # 0. Daily-loss circuit breaker — checked first, mirrors Repo 1
+    # 0a. Manual kill switch — checked first of all, cheapest short-circuit
+    # (avoids unnecessary Kite API calls for cooldown/time/tradability checks).
+    if get_kill_switch(r):
+        return False, "kill_switch_active"
+
+    # 0b. Daily-loss circuit breaker — mirrors Repo 1
     date_str = now_ist().strftime("%Y-%m-%d")
     if entries_blocked(r, date_str):
         reason = block_reason(r, date_str) or "entries blocked"

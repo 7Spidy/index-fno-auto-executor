@@ -40,8 +40,35 @@ COOLDOWN_AFTER_EXIT  = 15           # minutes in COOLDOWN phase before IDLE
 # Daily limits — v2 (live phase), ported from Repo 1 (src/paper_engine.py)
 MAX_TRADES_DAY       = None
 DAILY_LOSS_PCT       = 0.15
+
+# Dynamic lot sizing (live mode only) — decided once per day, see sizing.py /
+# run.py's main(). Paper mode always uses multiplier=1 (unchanged behaviour).
+LOT_MULTIPLIER_CAPITAL_THRESHOLD = 50_000   # capital >= this -> multiplier 2, else 1
 # DAILY_LOSS_LIMIT is no longer a static constant — live mode needs it computed
 # against real-time margins. Use sizing.get_daily_loss_limit(paper_mode, kite) instead.
+
+def _num(env_name: str, default: float) -> float:
+    """Read a numeric env-var override, falling back to `default` if unset
+    or unparseable. Mirrors Repo 1's env-override convention."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        return type(default)(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# Intra-minute trailing-SL sub-loop (OPEN-position management only — never
+# entry gates). EXEC_SUBLOOPS=1 fully reverts to today's single-pass
+# behaviour with no code change.
+TRACKER_SUBLOOPS      = int(_num("EXEC_SUBLOOPS", 4))       # total passes per tick, incl. the first
+TRACKER_SUBLOOP_SECS  = _num("EXEC_SUBLOOP_SECS", 15.0)      # seconds between sub-loop passes
+# Wall-clock budget from job start (EXEC_JOB_START_EPOCH, exported as the
+# workflow's first step) within which the sub-loop must complete — leaves
+# headroom below the GitHub Actions `timeout-minutes: 2` (120s) job limit to
+# account for checkout/pip-install cold start and processing time per pass.
+TRACKER_JOB_BUDGET_SECS = _num("EXEC_JOB_BUDGET_SECS", 100.0)
 
 # Mode — sourced from GitHub Actions repo/environment variable PAPER_MODE
 # ("true"/"false", case-insensitive). Defaults to True (safe) if unset.

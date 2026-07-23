@@ -19,12 +19,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: executor-tick
+  cancel-in-progress: true
+
 jobs:
   tick:
     runs-on: ubuntu-latest
     timeout-minutes: 2      # each run must complete well within the 1-min cadence
+                             # worst case: ~1 (first pass) + 3x15s (subloop sleeps)
+                             # + processing per pass ~= 55-65s + cold start
+                             # (~15-20s with pip cache) -- confirm empirically in
+                             # paper mode before flipping PAPER_MODE=False
 
     steps:
+      - name: Export job-start epoch
+        run: echo "EXEC_JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5

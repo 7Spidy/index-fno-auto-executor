@@ -31,14 +31,38 @@ def compute_vwap(candles: pd.DataFrame) -> pd.Series:
 # ── RSI ───────────────────────────────────────────────────────────────────────
 
 def compute_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder's smoothed RSI."""
-    delta = closes.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_g = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_l = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs    = avg_g / avg_l.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    """Wilder-smoothed RSI. Seed = simple average of first `period` changes.
+
+    Manual recursion (not pandas .ewm) to stay byte-parity with Repo 1's
+    src/indicators.py::rsi_wilder — ewm's own seeding diverges slightly
+    from Wilder's explicit simple-average seed in the first bars after
+    min_periods.
+    """
+    close = closes.values.astype(float)
+    n = len(close)
+    rsi = np.full(n, np.nan)
+
+    if n < period + 1:
+        return pd.Series(rsi, index=closes.index, name="rsi")
+
+    deltas = np.diff(close)
+    gains = np.maximum(deltas, 0.0)
+    losses = np.maximum(-deltas, 0.0)
+
+    avg_gain = gains[:period].mean()
+    avg_loss = losses[:period].mean()
+
+    alpha = 1.0 / period
+    for i in range(period, n - 1):
+        avg_gain = avg_gain * (1 - alpha) + gains[i] * alpha
+        avg_loss = avg_loss * (1 - alpha) + losses[i] * alpha
+        if avg_loss == 0.0:
+            rsi[i + 1] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i + 1] = 100.0 - (100.0 / (1.0 + rs))
+
+    return pd.Series(rsi, index=closes.index, name="rsi")
 
 
 # ── ATR ───────────────────────────────────────────────────────────────────────

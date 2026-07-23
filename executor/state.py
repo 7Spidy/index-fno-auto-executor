@@ -70,6 +70,11 @@ _KEY_DISCORD_MSG_ID_PREFIX = "executor:discord_msg_id:" # + date_str (YYYY-MM-DD
 
 _KEY_PAPER_MODE_OVERRIDE = "executor:paper_mode_override"
 
+_KEY_LOT_MULTIPLIER_PREFIX = "executor:lot_multiplier:"   # + date_str (YYYY-MM-DD)
+_LOT_MULTIPLIER_TTL_SECS   = 86400
+
+_KEY_KILL_SWITCH = "executor:kill_switch"
+
 
 def _loads_tolerant(raw: Any) -> Any:
     """Decode a Redis JSON value, tolerating a double-encoded payload.
@@ -359,3 +364,49 @@ def set_paper_mode_override(r: redis_lib.Redis, value: bool) -> None:
 def clear_paper_mode_override(r: redis_lib.Redis) -> None:
     r.delete(_KEY_PAPER_MODE_OVERRIDE)
     log.info("state: PAPER_MODE override cleared — falling back to env/config default")
+
+
+# ── Dynamic lot multiplier (live mode, decided once per day) ───────────────────
+
+def _lot_multiplier_key(date_str: str) -> str:
+    return f"{_KEY_LOT_MULTIPLIER_PREFIX}{date_str}"
+
+
+def get_lot_multiplier(r: redis_lib.Redis, date_str: str) -> Optional[int]:
+    """Returns the cached multiplier for date_str, or None if not yet decided."""
+    raw = r.get(_lot_multiplier_key(date_str))
+    if raw is None:
+        return None
+    val = raw.decode() if isinstance(raw, bytes) else raw
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_lot_multiplier_if_absent(r: redis_lib.Redis, date_str: str, value: int) -> bool:
+    """Atomic check-and-set (SETNX) so a slow/retried tick can't clobber an
+    already-decided multiplier. Returns True if this call set it, False if
+    another process already had."""
+    key = _lot_multiplier_key(date_str)
+    return bool(r.set(key, str(value), nx=True, ex=_LOT_MULTIPLIER_TTL_SECS))
+
+
+# ── Manual kill switch ──────────────────────────────────────────────────────────
+# Set/clear manually via redis-cli or an ad-hoc script, e.g.:
+#   redis-cli -u $REDIS_URL SET executor:kill_switch true
+#   redis-cli -u $REDIS_URL SET executor:kill_switch false
+# Blocks new entries only — open positions continue their normal
+# SL/target/trailing/exit lifecycle untouched. See gates.check_all().
+
+def get_kill_switch(r: redis_lib.Redis) -> bool:
+    raw = r.get(_KEY_KILL_SWITCH)
+    if raw is None:
+        return False
+    val = raw.decode() if isinstance(raw, bytes) else raw
+    return val.strip().lower() == "true"
+
+
+def set_kill_switch(r: redis_lib.Redis, value: bool) -> None:
+    r.set(_KEY_KILL_SWITCH, "true" if value else "false")
+    log.info("state: kill switch set to %s", "ON" if value else "OFF")

@@ -39,13 +39,18 @@ def try_enter(
     kite: "KiteClient",
     entry_ltp: float,
     exchange: str,
+    lot_multiplier: int = 1,
 ) -> None:
     """
     Called when gate passes.  Places entry marketable-LIMIT order and
-    transitions to ENTERING. Qty is fixed-lot, gated on capital availability
-    (see sizing.compute_qty).
+    transitions to ENTERING. Qty is fixed-lot × lot_multiplier, gated on
+    capital availability (see sizing.compute_qty).
     In paper mode the order fills immediately if marketable; check_entry_fill()
     is called next either way.
+
+    `lot_multiplier` — always 1 in paper mode; in live mode it's the
+    once-per-day multiplier decided in run.py's main() before the instrument
+    loop (see state.get_lot_multiplier).
     """
     ts = intent.get("tradingsymbol", "")
     log.info("manager: entering %s direction=%s", ts, intent.get("direction"))
@@ -58,6 +63,7 @@ def try_enter(
         entry_ltp=entry_ltp,
         paper_mode=config.PAPER_MODE,
         kite=kite if not config.PAPER_MODE else None,
+        lot_multiplier=lot_multiplier,
     )
     if qty == 0:
         log.warning("manager: sizing returned 0 — aborting entry")

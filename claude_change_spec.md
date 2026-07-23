@@ -1,356 +1,272 @@
-# Change Spec: Consolidated Discord Tracker for Repo 2 (index-fno-auto-executor)
+# Claude Change Spec — Repo 2 (index-fno-auto-executor) Live-Trading Sync
 
 ## Context & Goal
 
-Repo 1's `src/trade_notifier.py` posts ONE Discord message per day per channel
-(`send_paper_consolidated`), edits it in place every cycle via PATCH, and only
-opens a new message the next calendar day. Repo 2's `executor/journal.py`
-currently fires a brand-new, disposable message on every entry and exit
-(`notify_entry`, `notify_exit`) with no per-tick "still open" update and no
-message-ID tracking — which is why Discord only shows EXIT lines.
+Repo 1 (`index-fno-signal-bot`) has diverged from Repo 2 (`index-fno-auto-executor`)
+through several recent changes. Repo 2 is about to be switched from Paper Mode to
+real-money live trading on the Vultr Mumbai VPS against a Zerodha account. This
+spec brings Repo 2 to full logic parity with Repo 1 (condor engine excluded — it
+is Repo 1-only, advisory/backtest scope, not part of the executor signal path),
+and adds three new Repo 2-specific capabilities required for safe live-money
+operation: dynamic capital-based lot sizing, a manual kill switch, and an
+intra-minute trailing-SL sub-loop mirroring Repo 1's heartbeat cadence.
 
-Goal: port Repo 1's exact edit-in-place mechanism to Repo 2, scoped across all
-17 instruments in one consolidated embed, updated unconditionally every tick
-(all instruments processed → one PATCH), with PAPER/LIVE shown explicitly in
-the embed. `notify_gate_fail` stays a separate one-off message (mirrors Repo
-1's `send_trade_skipped`). `notify_entry`/`notify_exit` one-offs are removed —
-the consolidated message fully replaces their function.
+This is a real-money change. Every item below must be verifiably correct before
+`PAPER_MODE` is flipped to `false` on the VPS.
 
 ## Scope
 
-Files to modify:
-- `executor/state.py` — add closed-today list + discord message-ID persistence
-- `executor/journal.py` — add `_post_new`, `_edit_existing`, embed builder,
-  `update_consolidated_tracker()`; remove `notify_entry`, `notify_exit`
-- `executor/run.py` — remove the 3 call sites for `notify_entry`/`notify_exit`;
-  append to closed-today list at the COOLDOWN transition; call
-  `update_consolidated_tracker()` once per tick after the instrument loop
+**Files to modify:**
+- `executor/config.py` — add lot-multiplier threshold constants
+- `executor/sizing.py` — dynamic lot-count decision + `compute_qty()` signature change
+- `executor/state.py` — new Redis helpers: `get_lot_multiplier`/`set_lot_multiplier`,
+  `get_kill_switch`/`set_kill_switch`
+- `executor/gates.py` — kill-switch check added to `check_all()`
+- `executor/run.py` — restructure `main()` to (a) run the once-per-day lot decision
+  before the instrument loop, (b) wrap OPEN-position management in a 4×/15s
+  budget-anchored sub-loop mirroring `position_tracker._loop_config()`
+- `executor/manager.py` — no signature change expected, but must be re-verified
+  against Repo 1's latest `position_tracker.py` for any drift beyond the ladder
+  SL math already ported in `trailing.py`
+- `.github/workflows/executor.yml` — add `concurrency` group
+- `tests/test_sizing.py` — new tests for lot-multiplier logic
+- `tests/test_state.py` — new tests for kill-switch + lot-multiplier Redis helpers
+- New test file: `tests/test_run_subloop.py` (or extend an existing test file if
+  more idiomatic) — sub-loop scheduling/budget logic
 
-Files NOT touched: `executor/manager.py`, `executor/gates.py`,
-`executor/gateway/*`, `executor/config.py`, all of Repo 1. No schema change to
-the position dict itself — only new *auxiliary* Redis keys.
+**Files to verify (parity check only, condor excluded):**
+- `src/signals.py` vs any Repo 2 signal-consuming logic (Repo 2 does not
+  re-evaluate signals — confirm it only consumes Redis intent, never recomputes;
+  flag if this invariant has drifted)
+- `src/indicators.py` vs `executor/utils/indicators.py`
+- `src/position_tracker.py` (SL/target chain: `compute_ladder_sl` →
+  `compute_ai_adjusted_sl` → `compute_final_sl`, and the new sub-loop pattern)
+  vs `executor/trailing.py` + `executor/manager.py`
+- `src/charges.py` vs `executor/charges.py`
+- `src/trade_notifier.py` / `src/journal.py` (consolidated Discord embed,
+  edit-in-place pattern) vs `executor/journal.py`
+- `src/paper_engine.py` (capital/committed-premium logic) vs `executor/sizing.py`
+  + `executor/state.py` (`committed_premium`)
+
+**Explicitly out of scope:** `src/condor_engine.py`, `src/condor_config.py`,
+`src/condor_notifier.py`, and anything under `src/dynamic_stock_universe.py` /
+3PM momentum scanner (`src/momentum_scan/`) — these are Repo 1-only, no
+Repo 2 execution counterpart exists or is wanted.
 
 ## Steps
 
-### 1. `executor/state.py` — new keys
+### 1. Parity verification pass (do this first)
 
-Add near the existing `_KEY_*` constants:
+For each file pair listed under "Files to verify": diff the actual logic
+(not just function names) between Repo 1's source and Repo 2's mirrored
+module. Produce a short parity report as you go (which functions match,
+which don't, and why) — do not silently assume parity. Any discrepancy found
+that isn't one of the two sanctioned differences below must be flagged and
+fixed to match Repo 1 exactly:
 
-```python
-_KEY_CLOSED_TODAY_PREFIX = "executor:closed_today:"    # + date_str (YYYY-MM-DD), Redis list
-_KEY_DISCORD_MSG_ID_PREFIX = "executor:discord_msg_id:" # + date_str (YYYY-MM-DD)
+- **Sanctioned difference #1:** Live-mode capital source. Repo 1 always uses
+  the fixed `DAILY_CAPITAL` constant (₹50,000). Repo 2 in paper mode uses the
+  same fixed `CAPITAL_RS` (₹50,000); in live mode it uses
+  `kite.get_margins()` real-time capital instead.
+- **Sanctioned difference #2 (new, this spec):** Lot sizing. Repo 1 always
+  trades 1 lot. Repo 2 in paper mode always trades 1 lot (unchanged). Repo 2
+  in live mode uses **dynamic lot count** per the rule in Step 2 below.
+
+Everything else — signal-consumption boundaries, SL/target math, charges
+math, trailing ladder math, Discord/Notion journaling patterns, gate logic
+(cooldown, no-open-position, time window, option-tradability) — must be
+logically identical. Grep guard before finishing this step:
+
 ```
+grep -rn "max_risk_pts\|MAX_RISK_POINTS\|_risk_ok\|VWAP_PROXIMITY_PTS" repo2/executor/*.py
+```
+This must return nothing (both are confirmed dead/removed in Repo 1 and must
+never be reintroduced in Repo 2).
 
-Add new functions (place after `block_reason`, before the paper-mode-override
-block):
+### 2. Dynamic lot sizing (live mode only)
+
+**Rule:** Once per trading day, the first time the live-mode capital check
+succeeds, decide a lot-multiplier for the entire day:
+- Capital `< ₹50,000` → multiplier = 1
+- Capital `>= ₹50,000` → multiplier = 2
+
+This decision is made **exactly once per day**, cached in Redis, and reused
+for every instrument and every remaining tick that day. It must NOT be
+re-evaluated on every capital check or before every trade.
+
+**Where the decision happens:** In `executor/run.py`'s `main()`, not inside
+`_run_one_instrument()` or `sizing.compute_qty()`. Add a step immediately
+after the paper/live mode is resolved and before the instrument loop:
 
 ```python
-def _closed_today_key(date_str: str) -> str:
-    return f"{_KEY_CLOSED_TODAY_PREFIX}{date_str}"
-
-
-def append_closed_today(r: redis_lib.Redis, date_str: str, record: dict) -> None:
-    """Append one closed-trade record to today's list. TTL refreshed on every
-    write so the list survives until end of day regardless of write order."""
-    key = _closed_today_key(date_str)
-    r.rpush(key, json.dumps(record))
-    r.expire(key, _DAILY_KEY_TTL_SECS)
-
-
-def get_closed_today(r: redis_lib.Redis, date_str: str) -> list[dict]:
-    raw_list = r.lrange(_closed_today_key(date_str), 0, -1)
-    out: list[dict] = []
-    for raw in raw_list or []:
+if not _PAPER_MODE:
+    date_str = now_ist().date().isoformat()
+    multiplier = state_module.get_lot_multiplier(r, date_str)
+    if multiplier is None:
         try:
-            out.append(_loads_tolerant(raw))
-        except Exception:
-            continue
-    return out
-
-
-def _discord_msg_id_key(date_str: str) -> str:
-    return f"{_KEY_DISCORD_MSG_ID_PREFIX}{date_str}"
-
-
-def get_discord_msg_id(r: redis_lib.Redis, date_str: str) -> Optional[str]:
-    raw = r.get(_discord_msg_id_key(date_str))
-    return raw.decode() if isinstance(raw, bytes) else raw
-
-
-def set_discord_msg_id(r: redis_lib.Redis, date_str: str, msg_id: str) -> None:
-    r.set(_discord_msg_id_key(date_str), msg_id, ex=_DAILY_KEY_TTL_SECS)
+            capital = kite.get_margins(r)
+        except Exception as exc:
+            log.error("morning capital check failed: %s — no trading until resolved", exc)
+            return  # do not proceed with the tick; retry next minute
+        multiplier = 1 if capital < 50_000 else 2
+        # atomic check-and-set so a slow/retried tick can't clobber an
+        # already-decided value
+        set_ok = state_module.set_lot_multiplier_if_absent(r, date_str, multiplier)
+        if not set_ok:
+            multiplier = state_module.get_lot_multiplier(r, date_str)
+        log.info("lot multiplier for %s decided: capital=₹%.0f -> x%d", date_str, capital, multiplier)
+else:
+    multiplier = 1
 ```
 
-Note: `_loads_tolerant` and `_DAILY_KEY_TTL_SECS` already exist in this file
-— reused as-is, no redefinition.
+- `state.get_lot_multiplier(r, date_str)` → reads `executor:lot_multiplier:<date_str>`,
+  returns `int` or `None` if unset.
+- `state.set_lot_multiplier_if_absent(r, date_str, value)` → Redis `SETNX`
+  (or equivalent atomic check-and-set) on `executor:lot_multiplier:<date_str>`
+  with a TTL through end-of-day (e.g. `ex=86400`). Returns `True` if this call
+  set it, `False` if another process already had.
+- If capital fetch fails: **no entries proceed this tick** (return early from
+  `main()` before the instrument loop, or explicitly no-op every instrument's
+  entry gate). Do not fall back to 1 lot. Retry naturally happens next minute's
+  tick.
+- **`compute_qty()` signature change:** add a `lot_multiplier: int = 1` parameter.
+  Final `qty = lot_size * lot_multiplier`. In paper mode, callers must always
+  pass `lot_multiplier=1` explicitly (do not rely on the default silently —
+  make the call site explicit for auditability).
+- **Downstream breaking-change check (mandatory, do not skip):** grep every
+  caller of `compute_qty()` and confirm none of them assume qty == lot_size
+  (i.e., == 1 lot) elsewhere — check `charges.py` net P&L calc, `journal.py`
+  trade logging/Notion payload, Discord embed quantity display in
+  `journal.update_consolidated_tracker`. Fix any hardcoded assumption found.
 
-### 2. `executor/journal.py` — consolidated tracker
+### 3. Kill switch
 
-Add imports at top (alongside existing `datetime`/`ZoneInfo`):
+Add a Redis-backed manual kill switch, Repo 2-only (Repo 1 paper trading is
+unaffected):
 
+- Redis key: `executor:kill_switch` (string `"true"`/`"false"`, no TTL —
+  persists until manually cleared).
+- `state.get_kill_switch(r) -> bool` (default `False`/off if key absent).
+- `state.set_kill_switch(r, value: bool) -> None` — for manual operator use
+  (e.g., via `redis-cli` or a small ad-hoc script; no new Discord/workflow
+  control surface in this spec).
+- In `executor/gates.py`'s `check_all()`, add as the **first** check: if
+  kill switch is on, fail the gate with reason `"kill_switch_active"` before
+  any other check runs (cheap short-circuit, avoids unnecessary Kite API
+  calls for cooldown/time/tradability checks).
+- Kill switch blocks **new entries only**. Positions already OPEN continue
+  through their normal SL/target/trailing/exit lifecycle untouched — do not
+  force-squareoff on kill-switch activation.
+- Document this key and its manual-set procedure at the top of `gates.py`
+  and in this spec's own comments — do not bury it silently.
+
+### 4. Intra-minute trailing-SL sub-loop
+
+Mirror Repo 1's `position_tracker._loop_config()` pattern (4 sub-loops,
+15-second spacing, job-start-anchored budget deadline) — but scoped to
+**OPEN-position management only**, not the full per-tick instrument loop
+(no re-running of entry gates or `try_enter` inside the sub-loop).
+
+**Constants** (add to `executor/config.py`, mirroring Repo 1 naming):
 ```python
-from executor import state as state_module
+TRACKER_SUBLOOPS      = 4      # env override: EXEC_SUBLOOPS
+TRACKER_SUBLOOP_SECS  = 15.0   # env override: EXEC_SUBLOOP_SECS
 ```
+Keep the env-override pattern identical to Repo 1 (`_num()` helper reading
+`os.environ`, falling back to these defaults) so `EXEC_SUBLOOPS=1` fully
+reverts to today's single-pass behavior with no code change — same safety
+property Repo 1 relies on.
 
-Add module-level color constants (mirrors Repo 1's `trade_notifier.py`):
+**Restructure `run.py`'s `main()`:**
+1. Connect, resolve paper/live mode, resolve lot multiplier (Step 2) — single pass, as today.
+2. Run gate/entry/exit logic for all 17 instruments — single pass per tick, as today
+   (do NOT put this inside the sub-loop).
+3. For the sub-loop: collect the set of instruments currently in `OPEN` phase
+   after step 2. Then, budget-anchored exactly like Repo 1
+   (`slot_base = time.monotonic()` at completion of the first pass; deadline
+   = `TRACKER_JOB_START_EPOCH`-anchored budget minus elapsed), run up to
+   `TRACKER_SUBLOOPS - 1` additional passes of **only**
+   `manager.manage_position(...)` (trailing SL / target / exit-trigger check)
+   for each OPEN instrument, spaced `TRACKER_SUBLOOP_SECS` apart.
+4. Stop the sub-loop early if: no instruments are OPEN anymore (flat), or
+   past squareoff time, or the remaining time budget is exhausted (log and
+   skip remaining passes rather than overrunning the GitHub Actions timeout).
+5. Run the consolidated Discord tracker update **once**, after the sub-loop
+   completes (not once per sub-pass) — same as today's single call at the
+   end of `main()`.
+6. Set `TRACKER_JOB_START_EPOCH`-equivalent for Repo 2 — add an env var
+   (e.g. `EXEC_JOB_START_EPOCH`) exported as the first step of the GitHub
+   Actions job (`echo "EXEC_JOB_START_EPOCH=$(date +%s)" >> $GITHUB_ENV`) so
+   the budget deadline correctly accounts for checkout + pip install cold-start
+   time, exactly mirroring Repo 1's approach.
+7. Each sub-pass must have the same per-instrument exception isolation as the
+   main loop (`try/except` per instrument — one instrument's failure must
+   never block the others' trailing SL updates).
 
-```python
-OPEN_COLOR = 0x4FC3F7
-CLOSED_COLOR = 0x00C853
-LOSS_COLOR = 0xF44336
-```
+**Do not** re-run `gates.check_all()`, `manager.try_enter()`, or the kill-switch
+check inside the sub-loop — those remain once-per-tick. Only the OPEN-phase
+management/trailing/exit-check path repeats.
 
-Add `_post_new` / `_edit_existing`, ported verbatim from Repo 1's
-`trade_notifier.py` but pointed at `DISCORD_WEBHOOK_URL` (Repo 2's existing
-env var — no new secret needed):
+### 5. Workflow changes
 
-```python
-def _post_new(embed: dict) -> str | None:
-    if not _DISCORD_WEBHOOK:
-        return None
-    try:
-        resp = requests.post(
-            _DISCORD_WEBHOOK + "?wait=true",
-            json={"embeds": [embed]},
-            timeout=10,
-        )
-        if resp.status_code in (200, 204):
-            return str(resp.json().get("id", ""))
-        log.warning("journal: consolidated POST returned %d: %s",
-                    resp.status_code, resp.text[:200])
-        return None
-    except Exception as exc:
-        log.warning("journal: consolidated POST failed: %s", exc)
-        return None
+`.github/workflows/executor.yml`:
+- Add a `concurrency` group so overlapping cron-job.org triggers are
+  cancelled/queued rather than racing:
+  ```yaml
+  concurrency:
+    group: executor-tick
+    cancel-in-progress: true
+  ```
+- Add the job-start epoch export step (see Step 4.6 above) as the first step
+  in the `tick` job, before `actions/checkout`.
+- Re-check `timeout-minutes: 2` is still sufficient headroom: worst case is
+  ~1 (first pass) + 3×15s (sub-loop sleeps) + processing time per pass ≈
+  55-65s + cold start (~15-20s with pip cache) ≈ comfortably under 2 minutes,
+  but confirm this empirically in paper mode before going live and flag if
+  it's tight.
 
+### 6. Testing (hard gate — do not proceed to "ready to commit" without these passing)
 
-def _edit_existing(msg_id: str, embed: dict) -> bool:
-    if not _DISCORD_WEBHOOK:
-        return False
-    try:
-        resp = requests.patch(
-            f"{_DISCORD_WEBHOOK}/messages/{msg_id}",
-            json={"embeds": [embed]},
-            timeout=10,
-        )
-        ok = resp.status_code in (200, 204)
-        if not ok:
-            log.warning("journal: consolidated PATCH returned %d: %s",
-                        resp.status_code, resp.text[:200])
-        return ok
-    except Exception as exc:
-        log.warning("journal: consolidated PATCH failed: %s", exc)
-        return False
-```
+- `tests/test_sizing.py`: new tests for `compute_qty()` with `lot_multiplier`
+  parameter (1x and 2x cases), and for the lot-multiplier decision function
+  (capital < 50k → 1, capital >= 50k → 2, boundary at exactly 50k → 2).
+- `tests/test_state.py`: new tests for `get_kill_switch`/`set_kill_switch`
+  (default False, set True, set False again) and
+  `get_lot_multiplier`/`set_lot_multiplier_if_absent` (unset → None, first
+  set succeeds, second concurrent set is a no-op and returns existing value).
+- New or extended test file for the sub-loop scheduling logic: verify it
+  runs at most `TRACKER_SUBLOOPS` passes, stops early when no OPEN positions
+  remain, stops early when budget is exhausted, and that
+  `EXEC_SUBLOOPS=1` reverts to single-pass behavior.
+- Run the full existing test suite (`test_charges.py`, `test_trailing.py`,
+  `test_instruments.py`) to confirm no regression from the `compute_qty()`
+  signature change or the parity-fix pass in Step 1.
+- Run project linters if configured.
+- All of the above must pass before moving to the manual commit/push gate.
 
-Add embed builder — same field shape as Repo 1's
-`_build_consolidated_embed`, plus explicit mode label (Repo 1 has none,
-Repo 2 needs it since it serves both PAPER and LIVE):
-
-```python
-def _build_consolidated_embed(
-    open_positions: list[dict],
-    closed_positions: list[dict],
-    date_str: str,
-    mode_str: str,
-) -> dict:
-    fields = []
-
-    for pos in open_positions:
-        arrow = "↑" if pos.get("direction") == "CE" else "↓"
-        ltp   = pos.get("entry_premium", 0)  # updated via reconcile each tick
-        entry = pos.get("entry_premium", 0)
-        sl    = pos.get("sl_premium", 0)
-        qty   = pos.get("qty", 0)
-        direction = pos.get("direction", "?")
-        # Options always bought long — premium rising is always profit.
-        # Do not branch on direction (Repo 1's PE sign-inversion bug).
-        unreal = (ltp - entry) * qty
-        sign = "+" if unreal >= 0 else ""
-        fields.append({
-            "name": f"{pos.get('tradingsymbol', pos.get('instrument'))} {direction} {arrow} [OPEN]",
-            "value": (
-                f"Entry ₹{entry:.2f} · SL ₹{sl:.2f}\n"
-                f"Unrealized ≈ {sign}₹{unreal:.0f} (gross, est.)"
-            ),
-            "inline": False,
-        })
-
-    for rec in closed_positions:
-        arrow = "↑" if rec.get("direction") == "CE" else "↓"
-        pnl   = rec.get("pnl", 0) or 0
-        sign  = "+" if pnl >= 0 else ""
-        fields.append({
-            "name": f"{rec.get('tradingsymbol', rec.get('instrument'))} {rec.get('direction')} {arrow} [CLOSED]",
-            "value": (
-                f"Entry ₹{rec.get('entry_premium', 0):.2f} · "
-                f"Exit ₹{rec.get('exit_premium', 0):.2f} · "
-                f"Net {sign}₹{pnl:.2f} · {rec.get('exit_reason', '')}"
-            ),
-            "inline": False,
-        })
-
-    if not fields:
-        fields.append({
-            "name": "No activity",
-            "value": "No open or closed positions yet today.",
-            "inline": False,
-        })
-
-    return {
-        "title":     f"📊 Executor — {mode_str} — {date_str}",
-        "color":     OPEN_COLOR,
-        "fields":    fields,
-        "footer":    {"text": f"{mode_str} mode · updated each cycle"},
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-```
-
-Add the orchestrating function (called once per tick from `run.py`):
-
-```python
-def update_consolidated_tracker(r) -> bool:
-    """Rebuild and PATCH (or POST, on first call of the day) the single
-    consolidated Discord message covering all 17 instruments. Mirrors Repo
-    1's send_paper_consolidated. Called unconditionally once per tick,
-    regardless of whether anything changed this cycle."""
-    if not _DISCORD_WEBHOOK:
-        return False
-
-    date_str = datetime.now(_IST).date().isoformat()
-    mode_str = "PAPER" if os.getenv("PAPER_MODE", "true").lower() != "false" else "LIVE"
-
-    open_positions = []
-    for inst in state_module.list_open_instruments(r):
-        pos = state_module.load_position(r, inst)
-        if pos:
-            open_positions.append(pos)
-
-    closed_positions = state_module.get_closed_today(r, date_str)
-
-    embed = _build_consolidated_embed(open_positions, closed_positions, date_str, mode_str)
-
-    existing_id = state_module.get_discord_msg_id(r, date_str)
-    if existing_id:
-        return _edit_existing(existing_id, embed)
-
-    msg_id = _post_new(embed)
-    if msg_id:
-        state_module.set_discord_msg_id(r, date_str, msg_id)
-        log.info("journal: consolidated tracker message created (id=%s)", msg_id)
-        return True
-    return False
-```
-
-**Remove** `notify_entry()` and `notify_exit()` entirely (superseded by the
-consolidated tracker). Keep `notify_gate_fail()` unchanged — it remains the
-one-off skip-style notice, matching Repo 1's `send_trade_skipped` being
-separate from the consolidated message.
-
-### 3. `executor/run.py` — wire it in
-
-- Delete the 3 call sites:
-  - line 278: `journal.notify_entry(state_module.load_position(r, instrument) or {})`
-  - line 294: `journal.notify_entry(pos)`
-  - line 306: `journal.notify_exit(pos)`
-- In `_journal_if_cooldown`, right before `state_module.save_position`, append
-  the closing record to the daily list:
-
-```python
-def _journal_if_cooldown(r: redis_lib.Redis, instrument: str) -> None:
-    pos = state_module.load_position(r, instrument)
-    if pos and pos.get("phase") == "COOLDOWN" and not pos.get("notion_journaled"):
-        journal.log_trade_to_notion(pos)
-        date_str = datetime.now(IST).date().isoformat()
-        state_module.append_closed_today(r, date_str, pos)
-        pos["notion_journaled"] = True
-        state_module.save_position(r, instrument, pos)
-```
-
-  (`datetime` and `IST` are already imported at the top of `run.py`.)
-
-- In `main()`, after the instrument loop (after the `for inst_cfg in
-  config.INDICES + config.STOCKS:` block, before `log.info("=== executor
-  tick end ===")`), add the single unconditional update call:
-
-```python
-    # ── 4. Update consolidated Discord tracker — once per tick, always ─────────
-    try:
-        journal.update_consolidated_tracker(r)
-    except Exception as exc:
-        log.error("consolidated tracker update failed: %s", exc)
-
-    log.info("=== executor tick end ===")
-```
-
-### Edge cases handled
-
-- **Message ID lifecycle across squareoff / midnight**: date-keyed Redis key
-  (`executor:discord_msg_id:{date}`) with `ex=_DAILY_KEY_TTL_SECS` (86400,
-  already defined in `state.py`) — same mechanism as Repo 1. After 15:10
-  squareoff the closed section fills in on the existing message; a new date
-  → new key → new message next trading day. No manual rollover needed.
-- **Empty tick (no positions at all yet)**: embed falls back to a "No
-  activity" field, same as Repo 1.
-- **PAPER/LIVE mode switch mid-day**: mode label re-evaluated from
-  `PAPER_MODE` env var every call — reflects current mode even if it changed
-  since the message was first created.
-- **One instrument's failure isolation preserved**: the tracker update is
-  wrapped in its own try/except in `main()`, so a Discord API failure never
-  aborts the tick, matching the existing per-instrument isolation pattern.
-- **Duplicate closed-today entries**: guarded the same way Repo 1 guards
-  duplicate EOD rows — `notion_journaled` flag gates the append, so a
-  position can only be appended to `closed_today` once (same tick it's
-  journaled to Notion).
-
-## Verification Checklist
+## Verification checklist (grep guards — run all before declaring done)
 
 ```bash
-# 1. Confirm removed functions are gone and nothing still references them
-grep -n "notify_entry\|notify_exit" executor/journal.py executor/run.py
-# Expected: no output
+# Dead code must never reappear:
+grep -rn "max_risk_pts\|MAX_RISK_POINTS\|_risk_ok\|VWAP_PROXIMITY_PTS" executor/*.py
+# should return nothing
 
-# 2. Confirm new functions exist
-grep -n "_post_new\|_edit_existing\|_build_consolidated_embed\|update_consolidated_tracker" executor/journal.py
-grep -n "append_closed_today\|get_closed_today\|get_discord_msg_id\|set_discord_msg_id" executor/state.py
+# Confirm compute_qty() callers all pass lot_multiplier explicitly:
+grep -rn "compute_qty(" executor/*.py tests/*.py
 
-# 3. Confirm run.py wiring
-grep -n "update_consolidated_tracker\|append_closed_today" executor/run.py
+# Confirm condor logic was NOT ported (out of scope):
+grep -rln "condor" executor/*.py
+# should return nothing
 
-# 4. Syntax / import sanity
-python3 -m py_compile executor/journal.py executor/state.py executor/run.py
+# Confirm kill switch is checked first in gates.check_all():
+grep -n "kill_switch" executor/gates.py
 
-# 5. Run existing test suite — no regressions
-pytest -q
-
-# 6. If tests reference notify_entry/notify_exit, they must be updated/removed
-grep -rn "notify_entry\|notify_exit" tests/
+# Confirm sub-loop constants exist and are env-overridable:
+grep -n "TRACKER_SUBLOOPS\|TRACKER_SUBLOOP_SECS\|EXEC_SUBLOOPS\|EXEC_SUBLOOP_SECS" executor/config.py
 ```
 
-## Commit Message
+## Do not commit or push without manual confirmation
 
-```
-feat(journal): consolidated edit-in-place Discord tracker for executor
-
-- Port Repo 1's single-message-per-day pattern (POST once, PATCH every
-  tick) to Repo 2, scoped across all 17 instruments in one embed.
-- Add executor:closed_today:{date} and executor:discord_msg_id:{date}
-  Redis keys (state.py) to support cross-tick message-ID persistence
-  and same-day closed-trade aggregation.
-- Remove notify_entry/notify_exit one-off posts — fully superseded by
-  the consolidated tracker, called unconditionally once per tick from
-  run.py's main().
-- notify_gate_fail unchanged — remains a separate one-off notice,
-  mirroring Repo 1's send_trade_skipped.
-- Embed explicitly labels PAPER/LIVE mode (Repo 1 has no equivalent —
-  paper-only there).
-```
-
-## Frozen Files (do not touch in this change)
-
-- `executor/manager.py`
-- `executor/gates.py`
-- `executor/gateway/paper.py`, `executor/gateway/kite_live.py`
-- `executor/config.py`
-- `executor/utils/*`
-- All of `index-fno-signal-bot` (Repo 1) — this change is Repo 2 only
+`git diff --name-only` must be reviewed and explicitly approved before
+`git add` / `git commit` / `git push`. This is a real-money-trading system —
+no automatic commit under any circumstance.

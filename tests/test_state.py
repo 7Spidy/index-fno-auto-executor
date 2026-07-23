@@ -62,3 +62,63 @@ def test_last_signal_ts_is_per_instrument():
     r.get.return_value = None
     state.get_last_signal_ts(r, "niftybank_typo_ok")
     r.get.assert_called_once_with("executor:last_signal_ts:NIFTYBANK_TYPO_OK")
+
+
+# ── Kill switch ──────────────────────────────────────────────────────────────
+
+def test_get_kill_switch_default_false():
+    r = MagicMock()
+    r.get.return_value = None
+    assert state.get_kill_switch(r) is False
+
+
+def test_set_kill_switch_true_then_read_true():
+    r = MagicMock()
+    r.get.return_value = b"true"
+    assert state.get_kill_switch(r) is True
+
+
+def test_set_kill_switch_false_then_read_false():
+    r = MagicMock()
+    r.get.return_value = b"false"
+    assert state.get_kill_switch(r) is False
+
+
+def test_set_kill_switch_writes_expected_key_and_value():
+    r = MagicMock()
+    state.set_kill_switch(r, True)
+    r.set.assert_called_once_with("executor:kill_switch", "true")
+    r.reset_mock()
+    state.set_kill_switch(r, False)
+    r.set.assert_called_once_with("executor:kill_switch", "false")
+
+
+# ── Lot multiplier ───────────────────────────────────────────────────────────
+
+def test_get_lot_multiplier_unset_returns_none():
+    r = MagicMock()
+    r.get.return_value = None
+    assert state.get_lot_multiplier(r, "2026-07-23") is None
+
+
+def test_get_lot_multiplier_returns_int():
+    r = MagicMock()
+    r.get.return_value = b"2"
+    assert state.get_lot_multiplier(r, "2026-07-23") == 2
+
+
+def test_set_lot_multiplier_if_absent_first_call_succeeds():
+    r = MagicMock()
+    r.set.return_value = True   # Redis SETNX-style: True when key was absent
+    ok = state.set_lot_multiplier_if_absent(r, "2026-07-23", 2)
+    assert ok is True
+    r.set.assert_called_once_with(
+        "executor:lot_multiplier:2026-07-23", "2", nx=True, ex=86400,
+    )
+
+
+def test_set_lot_multiplier_if_absent_second_concurrent_call_is_noop():
+    r = MagicMock()
+    r.set.return_value = None   # NX set found the key already present
+    ok = state.set_lot_multiplier_if_absent(r, "2026-07-23", 2)
+    assert ok is False
